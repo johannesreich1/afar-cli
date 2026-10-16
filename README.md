@@ -33,7 +33,7 @@ With Homebrew (this repository is also its tap):
 
 ```bash
 brew tap johannesreich1/afar-rcd https://github.com/johannesreich1/afar-rcd
-brew install afar-rcd
+brew install johannesreich1/afar-rcd/afar-rcd
 afar-rcd doctor
 ```
 

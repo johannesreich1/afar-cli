@@ -1,6 +1,6 @@
 # Homebrew formula for afar-rcd. This repository doubles as its tap:
 #   brew tap johannesreich1/afar-rcd https://github.com/johannesreich1/afar-rcd
-#   brew install afar-rcd
+#   brew install johannesreich1/afar-rcd/afar-rcd   (the full name; Homebrew refuses short names from other taps)
 # For a new release, tag it, then update url and sha256 here.
 class AfarRcd < Formula
   desc "Keep Claude Code Remote Control running in the background"
