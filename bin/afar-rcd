@@ -1,0 +1,1389 @@
+#!/bin/bash
+#
+# afar-rcd - keep `claude remote-control` running in the background on macOS.
+#
+# Each service is a per-user launchd agent that runs a small supervisor
+# (`afar-rcd _run NAME`). The supervisor starts `claude remote-control` in the
+# service's folder, keeps the Mac awake with caffeinate while it runs, and
+# restarts it with backoff whenever it exits. launchd starts the supervisor at
+# login and restarts it if it dies.
+#
+# Only tools that ship with macOS are used (bash 3.2, launchctl, caffeinate,
+# osascript, plutil, script). The one dependency is the Claude Code CLI, which
+# `afar-rcd add` and `afar-rcd doctor` check for and offer to install.
+#
+# https://github.com/johannesreich1/afar-rcd - MIT License.
+# Not affiliated with or endorsed by Anthropic.
+
+set -u
+
+RCD_VERSION="0.1.0"
+PROG=${0##*/}
+
+# ---------------------------------------------------------------- settings ---
+
+RCD_HOME=${AFAR_RCD_HOME:-$HOME/.config/afar-rcd}
+RCD_LOG_DIR=${AFAR_RCD_LOG_DIR:-$HOME/Library/Logs/afar-rcd}
+RCD_AGENTS_DIR=${AFAR_RCD_AGENTS_DIR:-$HOME/Library/LaunchAgents}
+RCD_LABEL_PREFIX=${AFAR_RCD_LABEL_PREFIX:-com.github.afar-rcd}
+RCD_NOTIFY=${AFAR_RCD_NOTIFY:-1}
+
+# Supervisor timing, in seconds.
+RCD_BACKOFF_MIN=${AFAR_RCD_BACKOFF_MIN:-5}       # first restart delay
+RCD_BACKOFF_MAX=${AFAR_RCD_BACKOFF_MAX:-300}     # longest restart delay
+RCD_STABLE_AFTER=${AFAR_RCD_STABLE_AFTER:-300}   # a run this long resets the backoff
+RCD_RECHECK=${AFAR_RCD_RECHECK:-600}             # retry interval while setup is needed
+RCD_LOGIN_POLL=${AFAR_RCD_LOGIN_POLL:-30}        # sign-in check interval while signed out
+RCD_SETUP_GRACE=${AFAR_RCD_SETUP_GRACE:-60}      # wait before notifying that setup is needed
+RCD_STOP_TIMEOUT=${AFAR_RCD_STOP_TIMEOUT:-20}    # time claude gets to exit after SIGINT
+RCD_LOG_MAX_BYTES=${AFAR_RCD_LOG_MAX_BYTES:-10485760}
+RCD_WATCH_INTERVAL=${AFAR_RCD_WATCH_INTERVAL:-30} # how often a running service checks claude's output
+RCD_LOGIN_RECHECK=${AFAR_RCD_LOGIN_RECHECK:-600}  # retry interval after a sign-in problem
+RCD_RENOTIFY=${AFAR_RCD_RENOTIFY:-21600}          # repeat a notification while a problem lasts
+
+CLAUDE_INSTALL_URL="https://claude.ai/install.sh"
+CLAUDE_JSON="${CLAUDE_CONFIG_DIR:-$HOME}/.claude.json"
+
+# Variables copied into the launchd agent's environment when set, so the
+# service sees the same settings as the command that created it.
+PASS_ENV="AFAR_RCD_HOME AFAR_RCD_LOG_DIR AFAR_RCD_LABEL_PREFIX AFAR_RCD_NOTIFY
+AFAR_RCD_BACKOFF_MIN AFAR_RCD_BACKOFF_MAX AFAR_RCD_STABLE_AFTER AFAR_RCD_RECHECK
+AFAR_RCD_LOGIN_POLL AFAR_RCD_SETUP_GRACE AFAR_RCD_STOP_TIMEOUT AFAR_RCD_LOG_MAX_BYTES
+AFAR_RCD_WATCH_INTERVAL AFAR_RCD_LOGIN_RECHECK AFAR_RCD_RENOTIFY
+CLAUDE_CONFIG_DIR HTTP_PROXY HTTPS_PROXY NO_PROXY ALL_PROXY http_proxy https_proxy no_proxy all_proxy"
+
+# What `claude remote-control` prints in the situations the supervisor handles.
+RE_CONSENT='Enable Remote Control\?'
+RE_TRUST='Workspace not trusted|Trust .*\[y/N\]'
+# Sign-in problems, as listed in https://code.claude.com/docs/en/errors. When
+# it cannot renew its login, claude warns (and keeps running for about a day)
+# before it stops with "Authentication failed (401)".
+RE_LOGIN='must be logged in|claude auth login|claude /login|run /login|Please run /login|could not renew this computer|did not accept the sign-in|Authentication failed \(401\)|login expired|login was rejected|OAuth token (refresh failed|unavailable|revoked|has expired)|JWT refresh failed|Signed out of Claude'
+RE_URL="https://claude\\.ai/code[/?][^][:space:]\"'<>()"$'\033\007'"]*"
+
+# ------------------------------------------------------------------ output ---
+
+if [ -t 1 ]; then
+  C_BOLD=$'\033[1m' C_DIM=$'\033[2m' C_RED=$'\033[31m' C_GREEN=$'\033[32m' C_YELLOW=$'\033[33m' C_OFF=$'\033[0m'
+else
+  C_BOLD='' C_DIM='' C_RED='' C_GREEN='' C_YELLOW='' C_OFF=''
+fi
+
+say()  { printf '%s\n' "$*"; }
+info() { printf '%s==>%s %s\n' "$C_BOLD" "$C_OFF" "$*"; }
+ok()   { printf '%s✔%s %s\n' "$C_GREEN" "$C_OFF" "$*"; }
+warn() { printf '%swarning:%s %s\n' "$C_YELLOW" "$C_OFF" "$*" >&2; }
+die()  { printf '%serror:%s %s\n' "$C_RED" "$C_OFF" "$*" >&2; exit 1; }
+# shellcheck disable=SC2088 # a literal ~ for display
+tilde() { case "$1" in "$HOME"/*) printf '~/%s' "${1#"$HOME"/}" ;; *) printf '%s' "$1" ;; esac; }
+
+# Asks a yes/no question. --yes answers yes; without a terminal the answer is no.
+confirm() {
+  local def=${2:-y} ans
+  if [ "${RCD_ASSUME_YES:-0}" = 1 ]; then return 0; fi
+  [ -t 0 ] || return 1
+  if [ "$def" = y ]; then printf '%s [Y/n] ' "$1"; else printf '%s [y/N] ' "$1"; fi
+  read -r ans || return 1
+  case "$ans" in
+    [Yy]*) return 0 ;;
+    '') [ "$def" = y ] ;;
+    *) return 1 ;;
+  esac
+}
+
+# ------------------------------------------------------------------- paths ---
+
+label_of() { printf '%s.%s' "$RCD_LABEL_PREFIX" "$1"; }
+conf_of()  { printf '%s/services/%s.conf' "$RCD_HOME" "$1"; }
+plist_of() { printf '%s/%s.plist' "$RCD_AGENTS_DIR" "$(label_of "$1")"; }
+log_of()   { printf '%s/%s.log' "$RCD_LOG_DIR" "$1"; }
+state_of() { printf '%s/run/%s.state' "$RCD_HOME" "$1"; }
+pid_of()   { printf '%s/run/%s.pid' "$RCD_HOME" "$1"; }
+alert_of() { printf '%s/run/%s.alert' "$RCD_HOME" "$1"; }
+notified_of() { printf '%s/run/%s.notified' "$RCD_HOME" "$1"; }
+
+file_size() { stat -f %z "$1" 2>/dev/null || printf '0'; }
+
+# Absolute path of this script as it was invoked (a symlink stays a symlink,
+# so a service keeps working when the script behind it is updated).
+self_path() {
+  local d
+  d=$(cd "$(dirname "$0")" && pwd -P) || return 1
+  printf '%s/%s\n' "$d" "${0##*/}"
+}
+
+# PATH for the service: the usual install locations, then the PATH of the
+# shell that created it, then the system defaults, without duplicates.
+service_path() {
+  local out=":" p IFS=:
+  # shellcheck disable=SC2086 # split PATH on ':' on purpose
+  for p in "$HOME/.local/bin" /opt/homebrew/bin /opt/homebrew/sbin /usr/local/bin $PATH /usr/bin /bin /usr/sbin /sbin; do
+    [ -n "$p" ] || continue
+    case "$out" in *":$p:"*) ;; *) out="$out$p:" ;; esac
+  done
+  out=${out#:}
+  printf '%s' "${out%:}"
+}
+
+# --------------------------------------------------------------- services ---
+
+valid_name() { printf '%s' "$1" | grep -Eq '^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$'; }
+
+list_names() {
+  local f
+  for f in "$RCD_HOME"/services/*.conf; do
+    [ -e "$f" ] || continue
+    f=${f##*/}
+    printf '%s\n' "${f%.conf}"
+  done
+}
+
+# Loads a service config into RCD_DIR, RCD_KEEP_AWAKE, RCD_CLAUDE and RCD_ARGS.
+load_conf() {
+  local conf
+  conf=$(conf_of "$1")
+  [ -f "$conf" ] || return 1
+  RCD_DIR='' RCD_KEEP_AWAKE=always RCD_CLAUDE=''
+  RCD_ARGS=()
+  # shellcheck source=/dev/null
+  . "$conf"
+}
+
+need_conf() { load_conf "$1" || die "no service named '$1' (see: $PROG status)"; }
+
+write_conf() {
+  local name=$1 dir=$2 awake=$3 claude=$4 conf a
+  shift 4
+  conf=$(conf_of "$name")
+  mkdir -p "${conf%/*}" || die "cannot create ${conf%/*}"
+  {
+    printf '# afar-rcd service "%s". After editing, run: afar-rcd restart %s\n' "$name" "$name"
+    printf 'RCD_DIR=%q\n' "$dir"
+    printf 'RCD_KEEP_AWAKE=%q\n' "$awake"
+    printf 'RCD_CLAUDE=%q\n' "$claude"
+    printf 'RCD_ARGS=('
+    for a in "$@"; do printf ' %q' "$a"; done
+    printf ' )\n'
+  } >"$conf.tmp" || die "cannot write $conf"
+  mv -f "$conf.tmp" "$conf" || die "cannot write $conf"
+}
+
+name_for_dir() {
+  local n
+  for n in $(list_names); do
+    if (load_conf "$n" && [ "$RCD_DIR" = "$1" ]); then printf '%s\n' "$n"; return 0; fi
+  done
+  return 1
+}
+
+default_name() {
+  local base n i=2
+  base=$(printf '%s' "${1##*/}" | tr '[:upper:]' '[:lower:]' | tr -c 'a-z0-9._-' '-' |
+    sed -e 's/--*/-/g' -e 's/^[-._]*//' -e 's/-*$//' | cut -c1-48)
+  [ -n "$base" ] || base=project
+  n=$base
+  while [ -f "$(conf_of "$n")" ]; do n="$base-$i"; i=$((i + 1)); done
+  printf '%s\n' "$n"
+}
+
+# Turns a NAME or FOLDER argument (or nothing, when there is one service) into
+# a service name.
+resolve_name() {
+  local arg=${1-} names count dir n
+  if [ -z "$arg" ]; then
+    names=$(list_names)
+    count=$(printf '%s' "$names" | grep -c .)
+    [ "$count" -eq 1 ] && { printf '%s\n' "$names"; return 0; }
+    [ "$count" -eq 0 ] && die "no services yet. Add one with: $PROG add [folder]"
+    # shellcheck disable=SC2086 # one name per word
+    die "there are several services; name one: $(printf '%s ' $names)"
+  fi
+  [ -f "$(conf_of "$arg")" ] && { printf '%s\n' "$arg"; return 0; }
+  if [ -d "$arg" ]; then
+    dir=$(cd "$arg" && pwd -P)
+    n=$(name_for_dir "$dir") && { printf '%s\n' "$n"; return 0; }
+    die "no service for $(tilde "$dir"). Add one with: $PROG add \"$arg\""
+  fi
+  die "no service named '$arg' (see: $PROG status)"
+}
+
+set_state() {
+  local f
+  f=$(state_of "$1")
+  mkdir -p "${f%/*}" 2>/dev/null
+  {
+    printf 'ST_STATE=%q\n' "$2"
+    printf 'ST_SINCE=%q\n' "$(date +%s)"
+    printf 'ST_MESSAGE=%q\n' "${3-}"
+    printf 'ST_PID=%q\n' "${4-}"
+    printf 'ST_OFFSET=%q\n' "${5:-0}"
+  } >"$f.tmp" && mv -f "$f.tmp" "$f"
+}
+
+read_state() {
+  local f
+  ST_STATE='' ST_SINCE=0 ST_MESSAGE='' ST_PID='' ST_OFFSET=0
+  f=$(state_of "$1")
+  # shellcheck source=/dev/null
+  if [ -f "$f" ]; then . "$f"; fi
+}
+
+# What claude has logged during the current run.
+run_output() {
+  local log offset
+  read_state "$1"
+  log=$(log_of "$1")
+  [ -f "$log" ] || return 0
+  offset=$ST_OFFSET
+  if [ "$(file_size "$log")" -lt "$offset" ]; then offset=0; fi # rotated meanwhile
+  tail -c +"$((offset + 1))" "$log" 2>/dev/null
+}
+
+# The link claude printed for the current run: its environment link (which
+# lists all its sessions) if there is one, otherwise the latest session link.
+session_url() {
+  run_output "$1" | grep -Eo "$RE_URL" |
+    awk '/[?&]environment=/ { e = $0 } { a = $0 } END { if (e != "") print e; else if (a != "") print a }'
+}
+
+# Connected sessions, from claude's latest "Capacity: N/M" line.
+session_count() {
+  run_output "$1" | sed -n 's/.*Capacity: \([0-9][0-9]*\)\/.*/\1/p' | tail -n 1
+}
+
+# Lists the sessions claude (PID) is serving, as JSON or as tab-separated
+# "name status url" lines. claude remote-control runs one child process per
+# session, and each records its state in ~/.claude/sessions/<pid>.json. Those
+# files are internal to Claude Code, so this is best effort: no files, no
+# sessions listed (the session count still comes from claude's own output).
+session_list() {
+  local format=$1 pid=$2 kids
+  # ps rather than pgrep: in some sandboxes (such as a Claude Code session's
+  # own commands) `pgrep -P` finds nothing while ps still lists processes.
+  kids=$(ps -ax -o pid=,ppid= 2>/dev/null | awk -v p="$pid" '$2 == p { printf "%s ", $1 }')
+  if [ -z "$kids" ]; then
+    [ "$format" = json ] && printf '[]\n'
+    return 0
+  fi
+  # shellcheck disable=SC2086 # one pid per word
+  /usr/bin/osascript -l JavaScript - "$format" "${CLAUDE_CONFIG_DIR:-$HOME/.claude}/sessions" $kids 2>/dev/null <<'JXA' ||
+ObjC.import('Foundation');
+function run(argv) {
+  var format = argv[0], dir = argv[1], list = [];
+  for (var i = 2; i < argv.length; i++) {
+    var s = $.NSString.stringWithContentsOfFileEncodingError(dir + '/' + argv[i] + '.json', $.NSUTF8StringEncoding, null);
+    if (!s || s.isNil()) continue;
+    var j;
+    try { j = JSON.parse(s.js); } catch (e) { continue; }
+    var id = j.bridgeSessionId || null;
+    list.push({ id: id, name: j.name || null, url: id ? 'https://claude.ai/code/' + id : null, status: j.status || null,
+      since: j.statusUpdatedAt ? Math.floor(j.statusUpdatedAt / 1000) : null, pid: Number(argv[i]) });
+  }
+  if (format === 'json') return JSON.stringify(list);
+  return list.map(function (x) { return [x.name || '?', x.status || '?', x.url || ''].join('\t'); }).join('\n');
+}
+JXA
+    if [ "$format" = json ]; then printf '[]\n'; fi
+}
+
+# Prints $1 as a JSON string, or null when it is empty.
+json_str() {
+  if [ -z "$1" ]; then printf 'null'; return; fi
+  printf '%s' "$1" | LC_ALL=C awk '
+    { gsub(/\\/, "\\\\"); gsub(/"/, "\\\""); gsub(/\t/, "\\t"); gsub(/\r/, "\\r"); gsub(/[\001-\037]/, "")
+      printf "%s%s", (NR > 1 ? "\\n" : ""), $0 }
+    BEGIN { printf "\"" } END { printf "\"" }'
+}
+
+# Prints $1 if it is a number, otherwise null.
+json_num() { case "$1" in '' | *[!0-9]*) printf 'null' ;; *) printf '%s' "$1" ;; esac; }
+
+# Connected, Connecting, Reconnecting or Disconnected, from claude's status line.
+connection_state() {
+  run_output "$1" | sed -E -n 's/.*\[claude\] [^A-Za-z]*(Connected|Connecting|Reconnecting|Disconnected) .*/\1/p' | tail -n 1
+}
+
+# ------------------------------------------------------------------ claude ---
+
+find_claude() {
+  local c
+  for c in "${AFAR_RCD_CLAUDE:-}" "${RCD_CLAUDE:-}" "$(command -v claude 2>/dev/null)" \
+    "$HOME/.local/bin/claude" /opt/homebrew/bin/claude /usr/local/bin/claude "$HOME/.claude/local/claude"; do
+    if [ -n "$c" ] && [ -x "$c" ] && [ ! -d "$c" ]; then printf '%s\n' "$c"; return 0; fi
+  done
+  return 1
+}
+
+claude_auth_json() { "$1" auth status 2>/dev/null; }
+claude_logged_in() { claude_auth_json "$1" | grep -Eq '"loggedIn"[[:space:]]*:[[:space:]]*true'; }
+
+# Sets CLAUDE_BIN, installing Claude Code with the official installer if the
+# user agrees.
+ensure_claude() {
+  CLAUDE_BIN=$(find_claude) && return 0
+  warn "Claude Code (the 'claude' command) is not installed."
+  if confirm "Install it now with the official installer ($CLAUDE_INSTALL_URL)?" y; then
+    curl -fsSL "$CLAUDE_INSTALL_URL" | bash || die "the Claude Code installer failed"
+    CLAUDE_BIN=$(find_claude) || die "Claude Code was installed, but 'claude' was not found. Open a new terminal and try again."
+    ok "Installed $("$CLAUDE_BIN" --version 2>/dev/null)"
+  else
+    die "Claude Code is required. Install it with: curl -fsSL $CLAUDE_INSTALL_URL | bash"
+  fi
+}
+
+ensure_login() {
+  claude_logged_in "$CLAUDE_BIN" && return 0
+  warn "Claude Code is not signed in. Remote Control needs a claude.ai subscription (Pro, Max, Team or Enterprise)."
+  if [ -t 0 ] && confirm "Sign in now (opens your browser)?" y; then
+    "$CLAUDE_BIN" auth login || die "sign-in did not finish"
+    claude_logged_in "$CLAUDE_BIN" || die "still not signed in"
+    ok "Signed in"
+  else
+    die "sign in first with: claude auth login"
+  fi
+}
+
+# Prints yes, no or unknown: whether Claude Code trusts FOLDER (or a parent).
+trust_state() {
+  /usr/bin/osascript -l JavaScript - "$CLAUDE_JSON" "$1" 2>/dev/null <<'JXA' || printf 'unknown\n'
+ObjC.import('Foundation');
+function run(argv) {
+  var s = $.NSString.stringWithContentsOfFileEncodingError(argv[0], $.NSUTF8StringEncoding, null);
+  if (!s || s.isNil()) return 'unknown';
+  var cfg;
+  try { cfg = JSON.parse(s.js); } catch (e) { return 'unknown'; }
+  var projects = cfg.projects || {};
+  for (var d = argv[1]; ; d = d.replace(/\/[^\/]*$/, '') || '/') {
+    if (projects[d] && projects[d].hasTrustDialogAccepted) return 'yes';
+    if (d === '/') return 'no';
+  }
+}
+JXA
+}
+
+# Fills SVC_ENV with an `env -i` command line that gives a program about the
+# environment launchd gives the service, so a run in the terminal behaves like
+# the service will.
+build_service_env() {
+  local key val
+  SVC_ENV=(/usr/bin/env -i "HOME=$HOME" "USER=${USER:-$(id -un)}" "LOGNAME=${LOGNAME:-$(id -un)}"
+    "PATH=$(service_path)" "SHELL=${SHELL:-/bin/zsh}" "LANG=${LANG:-en_US.UTF-8}"
+    "TERM=${TERM:-xterm-256color}" "TMPDIR=${TMPDIR:-/tmp}")
+  for key in $PASS_ENV; do
+    val=${!key:-}
+    if [ -n "$val" ]; then SVC_ENV+=("$key=$val"); fi
+  done
+}
+
+# ----------------------------------------------------------------- launchd ---
+
+DOMAIN=''
+init_domain() {
+  if [ -n "${AFAR_RCD_DOMAIN:-}" ]; then
+    DOMAIN=$AFAR_RCD_DOMAIN
+  elif launchctl print "gui/$UID" >/dev/null 2>&1; then
+    DOMAIN="gui/$UID"
+  else
+    DOMAIN="user/$UID" # no GUI login, for example over SSH
+  fi
+}
+
+is_loaded()   { launchctl print "$DOMAIN/$(label_of "$1")" >/dev/null 2>&1; }
+is_disabled() { launchctl print-disabled "$DOMAIN" 2>/dev/null | grep -Fq "\"$(label_of "$1")\" => disabled" ||
+                launchctl print-disabled "$DOMAIN" 2>/dev/null | grep -Fq "\"$(label_of "$1")\" => true"; }
+agent_pid()   { launchctl print "$DOMAIN/$(label_of "$1")" 2>/dev/null | awk '$1 == "pid" && $2 == "=" { print $3; exit }'; }
+
+xml_escape() { printf '%s' "$1" | sed -e 's/&/\&amp;/g' -e 's/</\&lt;/g' -e 's/>/\&gt;/g'; }
+plist_env()  { printf '\t\t<key>%s</key>\n\t\t<string>%s</string>\n' "$(xml_escape "$1")" "$(xml_escape "$2")"; }
+
+write_plist() {
+  local name=$1 plist self log key val
+  plist=$(plist_of "$name")
+  log=$(log_of "$name")
+  self=$(self_path) || die "cannot work out where $PROG is installed"
+  mkdir -p "$RCD_AGENTS_DIR" "$RCD_LOG_DIR" || die "cannot create $RCD_AGENTS_DIR"
+  {
+    cat <<EOF
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+	<key>Label</key>
+	<string>$(xml_escape "$(label_of "$name")")</string>
+	<key>ProgramArguments</key>
+	<array>
+		<string>$(xml_escape "$self")</string>
+		<string>_run</string>
+		<string>$(xml_escape "$name")</string>
+	</array>
+	<key>RunAtLoad</key>
+	<true/>
+	<key>KeepAlive</key>
+	<true/>
+	<key>ThrottleInterval</key>
+	<integer>10</integer>
+	<key>ExitTimeOut</key>
+	<integer>$((RCD_STOP_TIMEOUT + 15))</integer>
+	<key>ProcessType</key>
+	<string>Interactive</string>
+	<key>StandardOutPath</key>
+	<string>$(xml_escape "$log")</string>
+	<key>StandardErrorPath</key>
+	<string>$(xml_escape "$log")</string>
+	<key>EnvironmentVariables</key>
+	<dict>
+EOF
+    plist_env PATH "$(service_path)"
+    plist_env SHELL "${SHELL:-/bin/zsh}"
+    plist_env LANG "${LANG:-en_US.UTF-8}"
+    for key in $PASS_ENV; do
+      val=${!key:-}
+      [ -n "$val" ] && plist_env "$key" "$val"
+    done
+    printf '\t</dict>\n</dict>\n</plist>\n'
+  } >"$plist.tmp" || die "cannot write $plist"
+  plutil -lint -s "$plist.tmp" >/dev/null || { rm -f "$plist.tmp"; die "generated an invalid launchd plist"; }
+  mv -f "$plist.tmp" "$plist"
+}
+
+wait_unloaded() {
+  local i
+  for i in $(seq 1 $(((RCD_STOP_TIMEOUT + 15) * 4))); do
+    is_loaded "$1" || return 0
+    sleep 0.25
+  done
+  return 1
+}
+
+svc_start() {
+  local name=$1 label plist
+  label=$(label_of "$name")
+  plist=$(plist_of "$name")
+  [ -f "$plist" ] || write_plist "$name"
+  launchctl enable "$DOMAIN/$label" 2>/dev/null
+  if is_loaded "$name"; then
+    launchctl kickstart "$DOMAIN/$label" >/dev/null 2>&1
+  elif ! launchctl bootstrap "$DOMAIN" "$plist" 2>/dev/null; then
+    sleep 1
+    is_loaded "$name" || launchctl bootstrap "$DOMAIN" "$plist" || die "launchctl could not load $(tilde "$plist")"
+  fi
+}
+
+# Stops the agent until the next login (`svc_stop` also keeps it stopped).
+svc_unload() {
+  is_loaded "$1" || return 0
+  launchctl bootout "$DOMAIN/$(label_of "$1")" >/dev/null 2>&1
+  wait_unloaded "$1" || warn "launchd is still stopping $(label_of "$1")"
+}
+
+svc_stop() {
+  launchctl disable "$DOMAIN/$(label_of "$1")" 2>/dev/null
+  svc_unload "$1"
+}
+
+svc_restart() {
+  if is_loaded "$1"; then
+    launchctl kickstart -k "$DOMAIN/$(label_of "$1")" >/dev/null 2>&1 || die "launchctl could not restart $1"
+  else
+    svc_start "$1"
+  fi
+}
+
+# Waits for a service started at or after T0 to come up. Returns 0 when it is
+# running, 2 when it needs the user, 1 on timeout.
+wait_ready() {
+  local name=$1 timeout=$2 t0=$3 i=0 running_for=0
+  READY_URL=''
+  while [ "$i" -lt $((timeout * 2)) ]; do
+    read_state "$name"
+    if [ "$ST_SINCE" -ge "$t0" ]; then
+      case "$ST_STATE" in
+        running)
+          READY_URL=$(session_url "$name")
+          [ -n "$READY_URL" ] && return 0
+          running_for=$((running_for + 1))
+          [ "$running_for" -ge 16 ] && return 0 # up for 8s without printing a link
+          ;;
+        needs-setup | needs-login | error | restarting) return 2 ;;
+      esac
+    fi
+    sleep 0.5
+    i=$((i + 1))
+  done
+  return 1
+}
+
+# Starts NAME and reports how it went, running setup when it needs it.
+start_and_report() {
+  local name=$1 t0 rc
+  t0=$(date +%s)
+  svc_start "$name"
+  wait_ready "$name" 45 "$t0"
+  rc=$?
+  if [ "$rc" -eq 2 ] && [ "$ST_STATE" = needs-setup ] && [ -t 0 ] && [ -t 1 ]; then
+    say "Remote Control needs a one-time confirmation before it can run in the background."
+    run_setup "$name"
+    return
+  fi
+  report "$name" "$rc"
+}
+
+report() {
+  local name=$1 rc=$2
+  case "$rc" in
+    0)
+      ok "'$name' is running in the background."
+      if [ -n "$READY_URL" ]; then say "  Session: $READY_URL"; fi
+      say "  Connect from the Claude app (Code tab) or https://claude.ai/code. It starts at login and restarts on its own."
+      ;;
+    2)
+      if [ "$ST_STATE" = restarting ]; then
+        warn "'$name' did not start: claude $ST_MESSAGE. Check: $PROG logs $name"
+      else
+        warn "'$name' is waiting: $ST_MESSAGE"
+      fi
+      return 1
+      ;;
+    *)
+      warn "'$name' has not reported in yet. Check: $PROG status $name   or   $PROG logs $name"
+      return 1
+      ;;
+  esac
+}
+
+# --------------------------------------------------------------- supervisor ---
+
+log() { printf '%s [afar-rcd] %s\n' "$(date '+%Y-%m-%d %H:%M:%S')" "$*" >>"$SUP_LOG"; }
+
+# Copies claude's output to the log as plain lines. Even without a terminal,
+# claude redraws its status block every second; this drops lines already
+# logged in the last few redraws, strips escape codes (keeping link targets),
+# timestamps each line, and rotates the log when it gets big.
+log_filter() {
+  RCD_LOGFILE=$1 /usr/bin/awk -v max="$RCD_LOG_MAX_BYTES" -v size="$(file_size "$1")" '
+    function stamp(   t, cmd) { cmd = "date \"+%Y-%m-%d %H:%M:%S\""; cmd | getline t; close(cmd); return t }
+    function clean(s,   out, seq) {
+      out = ""
+      while (match(s, /\033\]8;[^;\007\033]*;[^\007\033]*(\007|\033\\)/)) { # OSC 8 hyperlink
+        seq = substr(s, RSTART, RLENGTH)
+        out = out substr(s, 1, RSTART - 1)
+        s = substr(s, RSTART + RLENGTH)
+        sub(/^\033\]8;[^;]*;/, "", seq)
+        sub(/(\007|\033\\)$/, "", seq)
+        if (seq != "") link = seq
+        else if (link != "") { out = out " <" link ">"; link = "" }
+      }
+      s = out s
+      gsub(/\033\][^\007]*\007/, "", s)
+      gsub(/\033\[[0-9;?]*[A-Za-z]/, "", s)
+      gsub(/\033./, "", s)
+      gsub(/[\r\007]/, "", s)
+      sub(/[ \t]+$/, "", s)
+      return s
+    }
+    /\033\[[0-9]*A/ { frame++ } # cursor up: claude is redrawing
+    {
+      line = clean($0)
+      if (line == "") next
+      if (line ~ /Capacity: [0-9]/) { # logged on every change, so the latest one is current
+        if (line == capacity) next
+        capacity = line
+      } else if ((line in seen) && frame - seen[line] <= 10) { seen[line] = frame; next }
+      seen[line] = frame
+      if (frame % 1000 == 999) for (k in seen) if (frame - seen[k] > 100) delete seen[k]
+      out = stamp() " [claude] " line
+      if (size + length(out) + 1 > max) {
+        close(ENVIRON["RCD_LOGFILE"])
+        system("mv -f \"$RCD_LOGFILE\" \"$RCD_LOGFILE.1\"")
+        size = 0
+      }
+      print out >>ENVIRON["RCD_LOGFILE"]
+      fflush(ENVIRON["RCD_LOGFILE"])
+      size += length(out) + 1
+    }'
+}
+
+# Waits up to SECONDS for a child to exit. Polls instead of using `wait`:
+# with several children exiting at once, bash 3.2's `wait PID` can block until
+# some other child exits. (With job control on, bash reaps exited children by
+# itself, so `kill -0` fails as soon as the child is gone.) stderr is silenced
+# because bash reports a child killed by a signal ("[2]+ Terminated ...")
+# after the next command it runs.
+wait_gone() {
+  local pid=$1 n=$(($2 * 10))
+  {
+    while kill -0 "$pid"; do
+      [ "$n" -gt 0 ] || return 1
+      sleep 0.1
+      n=$((n - 1))
+    done
+    wait "$pid" # already gone, so this returns at once
+  } 2>/dev/null
+  return 0
+}
+
+# Gives the log filter a moment to write claude's last lines.
+finish_filter() {
+  [ -n "${FILTER_PID:-}" ] || return 0
+  wait_gone "$FILTER_PID" 3 || kill -- "-$FILTER_PID" 2>/dev/null || kill "$FILTER_PID" 2>/dev/null
+  FILTER_PID=''
+}
+
+# Shows a macOS notification. AFAR_RCD_NOTIFY=0 turns them off; =log writes
+# them to run/notifications.log instead (used by the tests).
+notify() {
+  case "$RCD_NOTIFY" in
+    0) return 0 ;;
+    log) printf '%s %s: %s\n' "$(date +%s)" "$1" "$2" >>"$RCD_HOME/run/notifications.log"; return 0 ;;
+  esac
+  /usr/bin/osascript - "$1" "$2" >/dev/null 2>&1 <<'OSA' || true
+on run argv
+	display notification (item 2 of argv) with title (item 1 of argv)
+end run
+OSA
+}
+
+# True if NAME has not had a KEY notification in the last RCD_RENOTIFY seconds.
+notify_due() {
+  local last
+  last=$(awk -v k="$2" '$1 == k { t = $2 } END { print t }' "$(notified_of "$1")" 2>/dev/null)
+  [ -z "$last" ] || [ $(($(date +%s) - last)) -ge "$RCD_RENOTIFY" ]
+}
+
+# Notifies about KEY for service NAME, at most once every RCD_RENOTIFY seconds.
+notify_key() {
+  local f
+  notify_due "$1" "$2" || return 0
+  f=$(notified_of "$1")
+  { grep -v "^$2 " "$f" 2>/dev/null; printf '%s %s\n' "$2" "$(date +%s)"; } >"$f.tmp" && mv -f "$f.tmp" "$f"
+  notify "afar-rcd: $1" "$3"
+}
+
+# Changes whenever Claude Code saves new sign-in details: a new login or a
+# token refresh. Reads only the keychain item's attributes, never the secret.
+login_fingerprint() {
+  local f="${CLAUDE_CONFIG_DIR:-$HOME/.claude}/.credentials.json"
+  if [ -f "$f" ]; then stat -f '%m %z %i' "$f"; return; fi
+  [ -z "${CLAUDE_CONFIG_DIR:-}" ] || return 0
+  security find-generic-password -s "Claude Code-credentials" 2>/dev/null | grep '"mdat"'
+}
+
+write_alert() {
+  local f
+  f=$(alert_of "$1")
+  { printf 'AL_SINCE=%q\n' "$(date +%s)"; printf 'AL_MESSAGE=%q\n' "$2"; printf 'AL_FINGERPRINT=%q\n' "$3"; } >"$f.tmp" &&
+    mv -f "$f.tmp" "$f"
+}
+
+read_alert() {
+  local f
+  AL_SINCE=0 AL_MESSAGE='' AL_FINGERPRINT=''
+  f=$(alert_of "$1")
+  # shellcheck source=/dev/null
+  if [ -f "$f" ]; then . "$f"; fi
+}
+
+# Runs next to claude. Every RCD_WATCH_INTERVAL seconds it reads claude's new
+# output for sign-in problems, so they show in `status` and as a notification
+# while claude keeps running (it warns about a day before it stops). Clears
+# the warning once the saved sign-in changes.
+watch_signin() {
+  local name=$1 offset=$2 alert size msg
+  alert=$(alert_of "$name")
+  while sleep "$RCD_WATCH_INTERVAL"; do
+    size=$(file_size "$SUP_LOG")
+    if [ "$size" -lt "$offset" ]; then offset=0; fi
+    msg=$(tail -c +"$((offset + 1))" "$SUP_LOG" 2>/dev/null | grep -F '[claude] ' | grep -E "$RE_LOGIN" |
+      tail -n 1 | sed 's/^.*\[claude\] //')
+    offset=$size
+    if [ -n "$msg" ] && [ ! -f "$alert" ]; then
+      log "sign-in problem: $msg"
+      write_alert "$name" "$msg" "$(login_fingerprint)"
+    fi
+    [ -f "$alert" ] || continue
+    read_alert "$name"
+    if [ "$(login_fingerprint)" != "$AL_FINGERPRINT" ]; then
+      rm -f "$alert"
+      log "the saved sign-in changed; clearing the sign-in warning"
+    else
+      notify_key "$name" login-warning "Claude Code cannot renew its sign-in for '$name'. Run: claude auth login"
+    fi
+  done
+}
+
+# After claude stopped over a sign-in problem, waits until a retry makes
+# sense: the saved sign-in changed, or (if claude still reports being signed
+# in) RCD_LOGIN_RECHECK seconds passed. Repeats the notification meanwhile.
+wait_for_signin() {
+  local fp waited=0
+  fp=$(login_fingerprint)
+  while :; do
+    notify_key "$SUP_NAME" login "Claude Code needs you to sign in again for '$SUP_NAME'. Run: claude auth login"
+    sleep_wait "$RCD_LOGIN_POLL"
+    waited=$((waited + RCD_LOGIN_POLL))
+    if [ "$(login_fingerprint)" != "$fp" ]; then
+      log "the saved sign-in changed; trying again"
+      return
+    fi
+    if [ "$waited" -ge "$RCD_LOGIN_RECHECK" ] && claude_logged_in "$CLAUDE_BIN"; then
+      log "trying again"
+      return
+    fi
+  done
+}
+
+backoff() {
+  local d=$RCD_BACKOFF_MIN i=1
+  while [ "$i" -lt "$1" ] && [ "$d" -lt "$RCD_BACKOFF_MAX" ]; do d=$((d * 2)); i=$((i + 1)); done
+  [ "$d" -gt "$RCD_BACKOFF_MAX" ] && d=$RCD_BACKOFF_MAX
+  printf '%s\n' "$d"
+}
+
+# Sleeps in a way a stop signal can interrupt.
+sleep_wait() {
+  sleep "$1" &
+  SLEEP_PID=$!
+  wait "$SLEEP_PID" 2>/dev/null
+  SLEEP_PID=''
+}
+
+start_caffeinate() {
+  local flag
+  case "${RCD_KEEP_AWAKE:-always}" in
+    always) flag=-i ;; # no idle sleep, on battery too
+    ac) flag=-s ;;     # no system sleep while on AC power
+    *) return 0 ;;
+  esac
+  /usr/bin/caffeinate "$flag" -w "$1" &
+  CAFF_PID=$!
+}
+
+stop_caffeinate() {
+  if [ -n "${CAFF_PID:-}" ]; then
+    kill "$CAFF_PID" 2>/dev/null
+    wait_gone "$CAFF_PID" 2
+  fi
+  CAFF_PID=''
+}
+
+# Stops claude the way Ctrl+C does (SIGINT to its process group), so its
+# sessions can be resumed, then escalates if it hangs.
+stop_child() {
+  local pid=$1
+  kill -INT -- "-$pid" 2>/dev/null || kill -INT "$pid" 2>/dev/null || return 0
+  wait_gone "$pid" "$RCD_STOP_TIMEOUT" && return 0
+  log "claude did not stop within ${RCD_STOP_TIMEOUT}s; sending SIGTERM"
+  kill -TERM -- "-$pid" 2>/dev/null || kill -TERM "$pid" 2>/dev/null
+  wait_gone "$pid" 5 && return 0
+  log "claude still running; sending SIGKILL"
+  kill -KILL -- "-$pid" 2>/dev/null || kill -KILL "$pid" 2>/dev/null
+  wait_gone "$pid" 2
+}
+
+# Stops a claude left behind by a supervisor that was killed outright.
+kill_stale() {
+  local f p cmd
+  f=$(pid_of "$1")
+  [ -f "$f" ] || return 0
+  p=$(cat "$f" 2>/dev/null)
+  rm -f "$f"
+  [ -n "$p" ] || return 0
+  cmd=$(ps -p "$p" -o command= 2>/dev/null) || return 0
+  case "$cmd" in *remote-control*) ;; *) return 0 ;; esac
+  log "stopping claude (pid $p) left over from an earlier run"
+  kill -INT -- "-$p" 2>/dev/null || kill -INT "$p" 2>/dev/null
+  wait_gone "$p" "$RCD_STOP_TIMEOUT" && return 0
+  kill -KILL -- "-$p" 2>/dev/null || kill -KILL "$p" 2>/dev/null
+}
+
+sup_stop() {
+  trap '' TERM INT HUP
+  log "received SIG$1, stopping"
+  if [ -n "${SLEEP_PID:-}" ]; then
+    kill "$SLEEP_PID" 2>/dev/null
+    wait_gone "$SLEEP_PID" 1
+  fi
+  if [ -n "${CHILD_PID:-}" ]; then stop_child "$CHILD_PID"; fi
+  stop_watcher
+  finish_filter
+  rm -f "$SUP_FIFO"
+  stop_caffeinate
+  rm -f "$(pid_of "$SUP_NAME")"
+  set_state "$SUP_NAME" stopped "stopped"
+  log "stopped"
+  exit 0
+}
+
+stop_watcher() {
+  if [ -n "${WATCH_PID:-}" ]; then
+    kill -- "-$WATCH_PID" 2>/dev/null || kill "$WATCH_PID" 2>/dev/null
+    wait_gone "$WATCH_PID" 2
+  fi
+  WATCH_PID=''
+}
+
+# Records a condition the user has to fix, notifies (at most every
+# RCD_RENOTIFY seconds), then waits WAIT seconds.
+problem() {
+  local key=$1 state=$2 msg=$3 wait=$4
+  log "$msg"
+  set_state "$SUP_NAME" "$state" "$msg"
+  if notify_due "$SUP_NAME" "$key"; then
+    if [ "$key" = setup ]; then
+      # An interactive `afar-rcd add` usually runs setup within this time.
+      sleep_wait "$RCD_SETUP_GRACE"
+      wait=$((wait > RCD_SETUP_GRACE ? wait - RCD_SETUP_GRACE : 0))
+    fi
+    notify_key "$SUP_NAME" "$key" "$msg"
+  fi
+  if [ "$wait" -gt 0 ]; then sleep_wait "$wait"; fi
+}
+
+cmd_run() {
+  local name=${1-} failures=0 started offset rc dur out delay filtered
+  [ -n "$name" ] || die "usage: $PROG _run NAME"
+  SUP_NAME=$name
+  SUP_LOG=$(log_of "$name")
+  SUP_FIFO="$RCD_HOME/run/$name.fifo"
+  CHILD_PID='' CAFF_PID='' SLEEP_PID='' FILTER_PID='' WATCH_PID=''
+  mkdir -p "$RCD_HOME/run" "$RCD_LOG_DIR" 2>/dev/null
+  exec >>"$SUP_LOG" 2>&1
+  # Job control puts claude in its own process group with default signal
+  # handling, so SIGINT reaches it the way Ctrl+C would.
+  set -m
+  trap 'sup_stop TERM' TERM
+  trap 'sup_stop INT' INT
+  trap 'sup_stop HUP' HUP
+  log "supervisor $RCD_VERSION started (pid $$)"
+  set_state "$name" starting "starting"
+  kill_stale "$name"
+
+  while :; do
+    if [ "$(file_size "$SUP_LOG")" -gt "$RCD_LOG_MAX_BYTES" ]; then
+      mv -f "$SUP_LOG" "$SUP_LOG.1"
+      exec >>"$SUP_LOG" 2>&1
+    fi
+    if ! load_conf "$name"; then
+      problem config error "service config is missing: $(conf_of "$name")" 3600
+      continue
+    fi
+    if ! cd "$RCD_DIR" 2>/dev/null; then
+      problem folder error "folder not found: $RCD_DIR" 60
+      continue
+    fi
+    if ! CLAUDE_BIN=$(find_claude); then
+      problem claude error "Claude Code (claude) is not installed. Install: curl -fsSL $CLAUDE_INSTALL_URL | bash" 60
+      continue
+    fi
+
+    started=$(date +%s)
+    offset=$(file_size "$SUP_LOG")
+    rm -f "$(alert_of "$name")"
+    log "starting claude remote-control${RCD_ARGS[*]+ ${RCD_ARGS[*]}} in $RCD_DIR"
+    rm -f "$SUP_FIFO"
+    if mkfifo "$SUP_FIFO" 2>/dev/null; then
+      filtered=1
+      log_filter "$SUP_LOG" <"$SUP_FIFO" &
+      FILTER_PID=$!
+      "$CLAUDE_BIN" remote-control ${RCD_ARGS[@]+"${RCD_ARGS[@]}"} </dev/null >"$SUP_FIFO" 2>&1 &
+    else
+      filtered=0
+      "$CLAUDE_BIN" remote-control ${RCD_ARGS[@]+"${RCD_ARGS[@]}"} </dev/null &
+    fi
+    CHILD_PID=$!
+    printf '%s\n' "$CHILD_PID" >"$(pid_of "$name")"
+    start_caffeinate "$CHILD_PID"
+    if [ "$filtered" = 1 ]; then
+      watch_signin "$name" "$offset" &
+      WATCH_PID=$!
+    fi
+    set_state "$name" running "" "$CHILD_PID" "$offset"
+
+    wait "$CHILD_PID" 2>/dev/null
+    rc=$?
+    CHILD_PID=''
+    stop_watcher
+    finish_filter
+    rm -f "$(pid_of "$name")" "$SUP_FIFO"
+    stop_caffeinate
+    dur=$(($(date +%s) - started))
+    if [ "$(file_size "$SUP_LOG")" -lt "$offset" ]; then offset=0; fi # rotated meanwhile
+    # Look only at what claude printed, not at this script's own messages.
+    if [ "$filtered" = 1 ]; then
+      out=$(tail -c +"$((offset + 1))" "$SUP_LOG" 2>/dev/null | grep -F '[claude] ' | tail -n 200)
+    else
+      out=$(tail -c +"$((offset + 1))" "$SUP_LOG" 2>/dev/null | tail -n 200)
+    fi
+
+    if printf '%s' "$out" | grep -Eq "$RE_CONSENT|$RE_TRUST"; then
+      problem setup needs-setup "Remote Control needs a one-time confirmation. Run: $PROG setup $name" "$RCD_RECHECK"
+      continue
+    fi
+    if printf '%s' "$out" | grep -Eq "$RE_LOGIN"; then
+      problem login needs-login "Claude Code needs you to sign in again for '$name'. Run: claude auth login" 0
+      wait_for_signin
+      continue
+    fi
+
+    if [ "$dur" -ge "$RCD_STABLE_AFTER" ]; then
+      failures=0
+      rm -f "$(notified_of "$name")" # it worked for a while: report new problems right away
+    fi
+    failures=$((failures + 1))
+    delay=$(backoff "$failures")
+    log "claude exited with status $rc after ${dur}s; restarting in ${delay}s"
+    set_state "$name" restarting "exited with status $rc; restarting in ${delay}s"
+    if [ "$failures" -ge 5 ]; then
+      notify_key "$name" crash "Remote Control keeps stopping (status $rc). Check: $PROG logs $name"
+    fi
+    sleep_wait "$delay"
+  done
+}
+
+# ------------------------------------------------------------------- setup ---
+
+# Runs `claude remote-control` once in the foreground so the user can answer
+# its one-time questions. Stops it as soon as it is up. Returns 0 if it came up.
+preflight() {
+  local dir=$1 tl pidf watcher
+  shift
+  tl=$(mktemp -t afar-rcd) || die "cannot create a temporary file"
+  pidf=$(mktemp -t afar-rcd) || die "cannot create a temporary file"
+  (
+    while sleep 0.5; do
+      p=$(cat "$pidf" 2>/dev/null)
+      [ -n "$p" ] || continue
+      kill -0 "$p" 2>/dev/null || exit 0
+      if grep -Eq "$RE_URL" "$tl" 2>/dev/null; then
+        sleep 3
+        kill -INT "$p" 2>/dev/null
+        exit 0
+      fi
+    done
+  ) &
+  watcher=$!
+  build_service_env
+  (
+    cd "$dir" || exit 1
+    # The inner shell records claude's pid ($$ survives the exec) for the watcher.
+    # shellcheck disable=SC2016 # $$ and $1 belong to the inner shell
+    /usr/bin/script -q -F "$tl" /bin/sh -c 'printf "%s" "$$" >"$1"; shift; exec "$@"' afar-rcd "$pidf" \
+      "${SVC_ENV[@]}" "$CLAUDE_BIN" remote-control "$@"
+  )
+  kill "$watcher" 2>/dev/null
+  wait "$watcher" 2>/dev/null
+  if grep -Eq "$RE_URL" "$tl"; then
+    rm -f "$tl" "$pidf"
+    return 0
+  fi
+  if grep -Eq "$RE_LOGIN" "$tl"; then warn "Claude Code is not signed in. Run: claude auth login"; fi
+  rm -f "$tl" "$pidf"
+  return 1
+}
+
+# Interactive setup for a service: pause it, run the preflight, start it again.
+run_setup() {
+  local name=$1 dir t0 rc
+  need_conf "$name"
+  dir=$RCD_DIR
+  [ -t 0 ] && [ -t 1 ] || die "setup asks questions; run it in a terminal: $PROG setup $name"
+  ensure_claude
+  ensure_login
+  svc_unload "$name"
+  say ""
+  info "Starting Remote Control in $(tilde "$dir") so you can answer its one-time questions."
+  say "    Answer ${C_BOLD}y${C_OFF} to \"Enable Remote Control?\" (and to trusting the folder, if asked)."
+  say "    Once it is running, $PROG closes it here and hands over to the background service."
+  say "    (If it does not close within a few seconds of showing the session link, press Ctrl+C.)"
+  say ""
+  if preflight "$dir" ${RCD_ARGS[@]+"${RCD_ARGS[@]}"}; then
+    say ""
+    ok "Remote Control is enabled for $(tilde "$dir")."
+    t0=$(date +%s)
+    svc_start "$name"
+    wait_ready "$name" 45 "$t0"
+    rc=$?
+    report "$name" "$rc"
+  else
+    say ""
+    warn "Remote Control did not start, so the background service stays paused."
+    say "Run '$PROG setup $name' to try again."
+    return 1
+  fi
+}
+
+# ---------------------------------------------------------------- commands ---
+
+usage() {
+  cat <<EOF
+$PROG $RCD_VERSION - keep 'claude remote-control' running in the background on macOS.
+
+Usage: $PROG <command> [options]
+
+Commands:
+  add [FOLDER]        Serve FOLDER (default: current folder) as a background service
+      -n, --name NAME           service name (default: from the folder name)
+      -a, --keep-awake MODE     always (default), ac (only on power) or off
+          --no-start            only install, do not start now
+      -y, --yes                 answer yes to questions (installing Claude Code)
+      -- ARGS...                extra arguments for 'claude remote-control',
+                                for example: -- --spawn worktree
+  remove NAME|--all   Stop a service and remove it
+  start  NAME|--all   Start a service (and start it at login again)
+  stop   NAME|--all   Stop a service and keep it stopped, even after a restart
+  restart NAME|--all  Restart a service
+  status [NAME] [--json]
+                      Show services, or details for one (--json: for scripts)
+  logs NAME [-f] [-n LINES]
+                      Show a service's log (-f to follow)
+  open [NAME]         Open the service's session in the browser
+  setup [NAME]        Answer Remote Control's one-time questions for a service
+  doctor              Check that everything needed is installed and working
+  version             Print the version
+
+NAME can also be the service's folder. With a single service, NAME is optional.
+Logs: $(tilde "$RCD_LOG_DIR")   Config: $(tilde "$RCD_HOME")
+EOF
+}
+
+cmd_add() {
+  local dir='' name='' awake=always start=1 args=() existing
+  while [ $# -gt 0 ]; do
+    case "$1" in
+      -n | --name) [ $# -ge 2 ] || die "$1 needs a value"; name=$2; shift 2 ;;
+      --name=*) name=${1#*=}; shift ;;
+      -a | --keep-awake) [ $# -ge 2 ] || die "$1 needs a value"; awake=$2; shift 2 ;;
+      --keep-awake=*) awake=${1#*=}; shift ;;
+      --no-start) start=0; shift ;;
+      -y | --yes) RCD_ASSUME_YES=1; shift ;;
+      -h | --help) usage; return 0 ;;
+      --) shift; args=("$@"); break ;;
+      -*) die "unknown option: $1" ;;
+      *) [ -z "$dir" ] || die "give one folder per service"; dir=$1; shift ;;
+    esac
+  done
+  [ -n "$dir" ] || dir=$PWD
+  [ -d "$dir" ] || die "not a folder: $dir"
+  dir=$(cd "$dir" && pwd -P) || die "cannot open $dir"
+  if [ "$dir" = "$(cd "$HOME" && pwd -P)" ] || [ "$dir" = / ]; then
+    die "pick a project folder: Claude Code never saves trust for $(tilde "$dir"), so it cannot run unattended there"
+  fi
+  case "$awake" in always | ac | off) ;; *) die "--keep-awake must be always, ac or off" ;; esac
+  if existing=$(name_for_dir "$dir"); then
+    die "$(tilde "$dir") is already served by '$existing' (see: $PROG status $existing)"
+  fi
+  [ -n "$name" ] || name=$(default_name "$dir")
+  valid_name "$name" || die "invalid name '$name': use letters, digits, '.', '_' and '-'"
+  [ -f "$(conf_of "$name")" ] && die "a service named '$name' already exists"
+
+  ensure_claude
+  ensure_login
+  if [ "$(trust_state "$dir")" = no ] && ! [ -t 0 ]; then
+    warn "Claude Code does not trust $(tilde "$dir") yet; the service will wait until you run: $PROG setup $name"
+  fi
+
+  write_conf "$name" "$dir" "$awake" "$CLAUDE_BIN" ${args[@]+"${args[@]}"}
+  write_plist "$name"
+  ok "Added '$name' for $(tilde "$dir")"
+  if [ "$start" = 1 ]; then
+    start_and_report "$name"
+  else
+    say "Start it with: $PROG start $name"
+  fi
+}
+
+# Runs FUNC for each service named in ARGS (NAME, FOLDER, --all or nothing).
+for_services() {
+  local func=$1 n
+  shift
+  if [ "${1-}" = --all ]; then
+    [ -n "$(list_names)" ] || { say "No services."; return 0; }
+    for n in $(list_names); do "$func" "$n"; done
+  else
+    n=$(resolve_name "${1-}") || exit 1
+    "$func" "$n"
+  fi
+}
+
+# Says so when stopping NAME interrupts connected sessions.
+note_sessions() {
+  local n
+  is_loaded "$1" || return 0
+  n=$(session_count "$1")
+  [ "${n:-0}" -gt 0 ] || return 0
+  say "Note: '$1' has $n connected session(s). This interrupts anything they are doing; $2."
+}
+
+do_remove() {
+  note_sessions "$1" "they go offline"
+  svc_unload "$1"
+  rm -f "$(plist_of "$1")" "$(conf_of "$1")" "$(state_of "$1")" "$(pid_of "$1")" "$(alert_of "$1")" \
+    "$(notified_of "$1")" "$(log_of "$1")" "$(log_of "$1").1"
+  ok "Removed '$1'"
+}
+
+do_start() {
+  need_conf "$1"
+  start_and_report "$1"
+}
+
+do_stop() {
+  note_sessions "$1" "they reconnect when you start it again"
+  svc_stop "$1"
+  ok "Stopped '$1'. It stays stopped until: $PROG start $1"
+}
+
+do_restart() {
+  local t0 rc
+  need_conf "$1"
+  note_sessions "$1" "they reconnect in a few seconds"
+  t0=$(date +%s)
+  svc_restart "$1"
+  wait_ready "$1" 45 "$t0"
+  rc=$?
+  report "$1" "$rc"
+}
+
+fmt_dur() {
+  local s=$1
+  if [ "$s" -ge 86400 ]; then printf '%dd%dh' $((s / 86400)) $((s % 86400 / 3600))
+  elif [ "$s" -ge 3600 ]; then printf '%dh%dm' $((s / 3600)) $((s % 3600 / 60))
+  elif [ "$s" -ge 60 ]; then printf '%dm%ds' $((s / 60)) $((s % 60))
+  else printf '%ds' "$s"; fi
+}
+
+# Sets S_STATE, S_PID, S_UPTIME, S_URL, S_SESSIONS, S_CONN and S_ALERT for a
+# service.
+svc_status() {
+  S_PID=- S_UPTIME=- S_URL='' S_SESSIONS=- S_CONN='' S_ALERT=''
+  read_state "$1"
+  if ! is_loaded "$1"; then
+    S_STATE=stopped
+    return
+  fi
+  S_STATE=${ST_STATE:-starting}
+  case "$S_STATE" in
+    stopped) S_STATE=starting ;;
+    running)
+      if [ -n "$ST_PID" ] && kill -0 "$ST_PID" 2>/dev/null; then
+        S_PID=$ST_PID
+        S_UPTIME=$(fmt_dur $(($(date +%s) - ST_SINCE)))
+        S_URL=$(session_url "$1")
+        S_SESSIONS=$(session_count "$1")
+        S_SESSIONS=${S_SESSIONS:-0}
+        S_CONN=$(connection_state "$1")
+        if [ -f "$(alert_of "$1")" ]; then
+          read_alert "$1"
+          S_STATE=needs-login # still running, but it will stop unless you sign in
+          S_ALERT=$AL_MESSAGE
+        fi
+      else
+        S_STATE=starting
+      fi
+      ;;
+  esac
+}
+
+# One service as a JSON object (see status_json).
+service_json() {
+  local n=$1 msg sessions='[]'
+  svc_status "$n"
+  msg=$S_ALERT
+  if [ -z "$msg" ] && [ "$S_STATE" != running ] && [ "$S_STATE" != stopped ]; then msg=$ST_MESSAGE; fi
+  if [ "$S_PID" != - ]; then sessions=$(session_list json "$S_PID"); fi
+  printf '{"name":%s,"folder":%s,"state":%s,"connection":%s,"pid":%s,"since":%s,"url":%s,"message":%s,' \
+    "$(json_str "$n")" "$(json_str "$RCD_DIR")" "$(json_str "$S_STATE")" "$(json_str "$S_CONN")" \
+    "$(json_num "$S_PID")" "$(json_num "$ST_SINCE")" "$(json_str "$S_URL")" "$(json_str "$msg")"
+  printf '"keep_awake":%s,"log":%s,"session_count":%s,"sessions":%s}' \
+    "$(json_str "$RCD_KEEP_AWAKE")" "$(json_str "$(log_of "$n")")" "$(json_num "$S_SESSIONS")" "${sessions:-[]}"
+}
+
+# Machine-readable status, for tools such as a menu bar app. The format is
+# versioned by "schema"; fields are only ever added within a schema version.
+status_json() {
+  local n first=1
+  printf '{"schema":1,"version":%s,"services":[' "$(json_str "$RCD_VERSION")"
+  for n in "$@"; do
+    load_conf "$n" || continue
+    if [ "$first" = 0 ]; then printf ','; fi
+    first=0
+    service_json "$n"
+  done
+  printf ']}\n'
+}
+
+cmd_status() {
+  local n names json=0 arg='' line
+  while [ $# -gt 0 ]; do
+    case "$1" in
+      --json) json=1 ;;
+      -*) die "unknown option: $1" ;;
+      *) arg=$1 ;;
+    esac
+    shift
+  done
+  if [ -n "$arg" ]; then
+    n=$(resolve_name "$arg") || exit 1
+    need_conf "$n"
+    if [ "$json" = 1 ]; then status_json "$n"; return 0; fi
+    svc_status "$n"
+    say "${C_BOLD}$n${C_OFF}  $S_STATE"
+    say "  folder:      $(tilde "$RCD_DIR")"
+    if [ -n "$S_URL" ]; then say "  session:     $S_URL"; fi
+    if [ -n "$S_CONN" ]; then say "  connection:  $S_CONN"; fi
+    if [ "$S_SESSIONS" != - ]; then say "  sessions:    $S_SESSIONS connected"; fi
+    if [ "$S_PID" != - ]; then
+      session_list text "$S_PID" | while IFS=$(printf '\t') read -r sname sstatus surl; do
+        [ -n "$sname" ] || continue
+        printf '               - %s (%s)%s\n' "$sname" "$sstatus" "${surl:+ $surl}"
+      done
+      say "  claude pid:  $S_PID (up $S_UPTIME)"
+    fi
+    if [ -n "$S_ALERT" ]; then
+      say "  problem:     $S_ALERT (since $(date -r "$AL_SINCE" '+%Y-%m-%d %H:%M'))"
+      say "  fix:         run 'claude auth login'; the service picks up the new sign-in by itself"
+    elif [ -n "$ST_MESSAGE" ] && [ "$S_STATE" != running ]; then
+      say "  message:     $ST_MESSAGE"
+    fi
+    say "  keep awake:  $RCD_KEEP_AWAKE"
+    say "  arguments:   remote-control${RCD_ARGS[*]+ ${RCD_ARGS[*]}}"
+    say "  launchd:     $DOMAIN/$(label_of "$n")$(is_disabled "$n" && printf ' (disabled)')"
+    say "  log:         $(tilde "$(log_of "$n")")"
+    return 0
+  fi
+  names=$(list_names)
+  if [ "$json" = 1 ]; then
+    # shellcheck disable=SC2086 # one name per word
+    status_json $names
+    return 0
+  fi
+  if [ -z "$names" ]; then
+    say "No services yet. Add one with: $PROG add [folder]"
+    return 0
+  fi
+  printf '%s%-20s %-12s %-7s %-8s %-8s %s%s\n' "$C_DIM" NAME STATE PID UPTIME SESSIONS FOLDER "$C_OFF"
+  for n in $names; do
+    load_conf "$n" || continue
+    svc_status "$n"
+    line=$(printf '%-20s %-12s %-7s %-8s %-8s %s' "$n" "$S_STATE" "$S_PID" "$S_UPTIME" "$S_SESSIONS" "$(tilde "$RCD_DIR")")
+    say "$line"
+  done
+}
+
+cmd_logs() {
+  local name='' follow=0 lines=50 log
+  while [ $# -gt 0 ]; do
+    case "$1" in
+      -f | --follow) follow=1; shift ;;
+      -n | --lines) [ $# -ge 2 ] || die "$1 needs a value"; lines=$2; shift 2 ;;
+      -*) die "unknown option: $1" ;;
+      *) name=$1; shift ;;
+    esac
+  done
+  name=$(resolve_name "$name") || exit 1
+  log=$(log_of "$name")
+  [ -f "$log" ] || die "no log yet: $(tilde "$log")"
+  if [ "$follow" = 1 ]; then exec tail -n "$lines" -F "$log"; fi
+  tail -n "$lines" "$log"
+}
+
+cmd_open() {
+  local n url
+  n=$(resolve_name "${1-}") || exit 1
+  url=$(session_url "$n")
+  open "${url:-https://claude.ai/code}"
+}
+
+cmd_setup() {
+  local n
+  n=$(resolve_name "${1-}") || exit 1
+  run_setup "$n"
+}
+
+cmd_doctor() {
+  local bad=0 v n self auth
+  say "${C_BOLD}afar-rcd $RCD_VERSION${C_OFF}"
+  ok "macOS $(sw_vers -productVersion 2>/dev/null), launchd domain $DOMAIN"
+
+  self=$(self_path)
+  if [ "$(command -v "$PROG" 2>/dev/null)" ]; then
+    ok "$PROG is on your PATH"
+  else
+    warn "$PROG is not on your PATH ($(tilde "$self")). Add its folder to PATH, or reinstall with install.sh."
+  fi
+
+  ensure_claude
+  v=$("$CLAUDE_BIN" --version 2>/dev/null)
+  ok "Claude Code ${v:-(version unknown)} at $(tilde "$CLAUDE_BIN")"
+  ensure_login
+  auth=$(claude_auth_json "$CLAUDE_BIN")
+  if printf '%s' "$auth" | grep -q '"authMethod": *"claude.ai"'; then
+    ok "Signed in to claude.ai"
+  else
+    warn "Signed in, but not with a claude.ai account. Remote Control needs a claude.ai subscription."
+    bad=1
+  fi
+
+  for n in $(list_names); do
+    load_conf "$n" || continue
+    svc_status "$n"
+    if [ ! -d "$RCD_DIR" ]; then
+      warn "'$n': folder $(tilde "$RCD_DIR") is gone"; bad=1
+    elif [ ! -f "$(plist_of "$n")" ]; then
+      warn "'$n': launchd agent missing. Fix: $PROG start $n"; bad=1
+    elif [ "$S_STATE" = running ]; then
+      ok "'$n' is running ($(tilde "$RCD_DIR"))"
+    elif [ "$S_STATE" = stopped ]; then
+      ok "'$n' is stopped. Start it with: $PROG start $n"
+    else
+      warn "'$n' is $S_STATE: ${S_ALERT:-$ST_MESSAGE}"; bad=1
+    fi
+    if [ "$(trust_state "$RCD_DIR")" = no ]; then
+      warn "'$n': Claude Code does not trust $(tilde "$RCD_DIR") yet. Fix: $PROG setup $n"; bad=1
+    fi
+  done
+  restart_note
+  [ "$bad" = 0 ] && ok "All good."
+  return "$bad"
+}
+
+# Explains whether services come back by themselves after the Mac restarts.
+restart_note() {
+  local auto
+  auto=$(defaults read /Library/Preferences/com.apple.loginwindow autoLoginUser 2>/dev/null)
+  if [ -n "$auto" ] && [ "$auto" = "$(id -un)" ]; then
+    ok "After a restart, macOS logs you in automatically and the services start by themselves"
+  elif fdesetup status 2>/dev/null | grep -q 'FileVault is On'; then
+    say "• After a restart, services start once you log in. FileVault is on, so macOS cannot log in by itself."
+    say "  For a planned restart, 'sudo fdesetup authrestart' unlocks the disk once without the login screen."
+  else
+    say "• After a restart, services start once you log in. To start them without you, turn on"
+    say "  automatic login: System Settings > Users & Groups > Automatically log in as."
+  fi
+}
+
+main() {
+  local cmd=${1-help}
+  [ $# -gt 0 ] && shift
+  case "$cmd" in
+    help | -h | --help) usage; return 0 ;;
+    version | -v | --version) say "$PROG $RCD_VERSION"; return 0 ;;
+  esac
+  [ "$(uname -s)" = Darwin ] || die "$PROG runs on macOS only"
+  case "$cmd" in
+    _run) cmd_run "$@" ;;
+    add | install) init_domain; cmd_add "$@" ;;
+    remove | rm | uninstall) init_domain; for_services do_remove "$@" ;;
+    start) init_domain; for_services do_start "$@" ;;
+    stop) init_domain; for_services do_stop "$@" ;;
+    restart) init_domain; for_services do_restart "$@" ;;
+    status | ls | list) init_domain; cmd_status "$@" ;;
+    logs | log) cmd_logs "$@" ;;
+    open) cmd_open "$@" ;;
+    setup) init_domain; cmd_setup "$@" ;;
+    doctor) init_domain; cmd_doctor ;;
+    *) usage >&2; die "unknown command: $cmd" ;;
+  esac
+}
+
+if [ "${AFAR_RCD_LIB:-0}" != 1 ]; then main "$@"; fi
