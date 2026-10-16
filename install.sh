@@ -35,9 +35,13 @@ if [ "${1-}" = --uninstall ]; then
 fi
 
 # From a clone, install the copy next to this script; otherwise download it.
+# Piped from curl there is no script file (BASH_SOURCE is empty), so a
+# bin/afar-rcd in the current folder must not be mistaken for a clone.
 src=''
-here=$(cd "$(dirname "${BASH_SOURCE[0]:-$0}")" 2>/dev/null && pwd -P) || here=''
-if [ -n "$here" ] && [ -f "$here/bin/afar-rcd" ]; then src="$here/bin/afar-rcd"; fi
+if [ -n "${BASH_SOURCE[0]-}" ]; then
+  here=$(cd "$(dirname "${BASH_SOURCE[0]}")" 2>/dev/null && pwd -P) || here=''
+  if [ -n "$here" ] && [ -f "$here/bin/afar-rcd" ]; then src="$here/bin/afar-rcd"; fi
+fi
 
 mkdir -p "$BIN_DIR"
 tmp="$TARGET.new.$$"
