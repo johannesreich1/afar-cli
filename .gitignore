@@ -1,2 +1,15 @@
 .DS_Store
 *.new.*
+
+# AI assistant files stay local: Claude Code's project settings, memory and
+# instructions, MCP config, other agents' files, and the plans and notes they
+# write. The project's own docs are README.md, CHANGELOG.md and LICENSE.
+.claude/
+.claude.json
+CLAUDE.md
+CLAUDE.local.md
+.mcp.json
+AGENTS.md
+.agents/
+docs/
+*PLAN.md
