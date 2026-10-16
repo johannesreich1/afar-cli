@@ -6,7 +6,7 @@ class AfarRcd < Formula
   desc "Keep Claude Code Remote Control running in the background"
   homepage "https://github.com/johannesreich1/afar-rcd"
   url "https://github.com/johannesreich1/afar-rcd/archive/refs/tags/v0.2.0.tar.gz"
-  sha256 "0000000000000000000000000000000000000000000000000000000000000000"
+  sha256 "ad797bdc3e9956d2b5f378d457d8f37d66a56d9adc1e2f0e194d52eec1e9d7b7"
   license "MIT"
   head "https://github.com/johannesreich1/afar-rcd.git", branch: "main"
 
