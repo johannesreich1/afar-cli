@@ -100,6 +100,8 @@ trap cleanup EXIT
 
 show_log() { printf '    --- log of %s ---\n' "$1"; tail -n 25 "$T/saved-logs/$1.log" 2>/dev/null | sed 's/^/    /'; }
 
+printf 'launchd domain: %s\n' "$(domain)"
+
 # ------------------------------------------------------------------------------
 section "helpers"
 lib() { AFAR_RCD_LIB=1 /bin/bash -c ". '$TOOL'; $1"; }
