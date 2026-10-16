@@ -112,7 +112,7 @@ launchd (starts at login, restarts the supervisor if it dies)
     └── sign-in watcher             spots sign-in problems while claude runs
 ```
 
-- Each service is a launchd agent, `~/Library/LaunchAgents/com.github.afar-rcd.NAME.plist`.
+- Each service is a launchd agent, `~/Library/LaunchAgents/com.github.johannesreich1.afar-rcd.NAME.plist`.
 - The supervisor stops Remote Control the way Ctrl+C does. Sessions it was serving stay resumable, and the next start in the same folder brings them back (Claude Code keeps them for about four hours).
 - If Remote Control exits, the supervisor restarts it after 5 seconds, doubling the wait up to 5 minutes while it keeps failing. A run that lasts 5 minutes resets the wait.
 - If Remote Control needs the one-time confirmation or folder trust, the service waits, retries every 10 minutes and sends one notification. If you are signed out, it waits until you sign in again.
@@ -162,7 +162,7 @@ afar-rcd doctor
 `afar-rcd status --json` (or `status NAME --json`) prints one JSON object, for example for a menu bar app:
 
 ```json
-{"schema": 1, "version": "0.1.0", "services": [{
+{"schema": 1, "version": "0.2.0", "services": [{
   "name": "my-app", "folder": "/Users/me/Projects/my-app", "state": "running",
   "connection": "Connected", "pid": 54892, "since": 1792160683,
   "url": "https://claude.ai/code?environment=env_...", "message": null,
@@ -224,7 +224,7 @@ make lint   # shellcheck
 make test   # runs real launchd agents against a fake claude, in a temp folder
 ```
 
-The tests use `test/fake-claude` in place of Claude Code and their own launchd labels (`com.github.afar-rcd.selftest.*`), so they never touch your real services. The fake behaves like the real CLI where it matters: it redraws its status every fraction of a second, prints Claude Code's real sign-in warnings and errors, and runs a child process per session. The tests take about four minutes, because they exercise real restarts, timeouts and launchd throttling.
+The tests use `test/fake-claude` in place of Claude Code and their own launchd labels (`com.github.johannesreich1.afar-rcd.selftest.*`), so they never touch your real services. The fake behaves like the real CLI where it matters: it redraws its status every fraction of a second, prints Claude Code's real sign-in warnings and errors, and runs a child process per session. The tests take about four minutes, because they exercise real restarts, timeouts and launchd throttling.
 
 ## License
 

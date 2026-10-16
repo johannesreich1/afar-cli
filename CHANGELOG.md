@@ -1,5 +1,9 @@
 # Changelog
 
+## 0.2.0 - 2026-10-16
+
+- launchd labels moved to com.github.johannesreich1.afar-rcd.NAME, like Afar's bundle id.
+
 ## 0.1.0 - 2026-10-16
 
 First release.

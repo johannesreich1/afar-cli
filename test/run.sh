@@ -16,7 +16,7 @@ T=$(cd "$T" && pwd -P)
 export AFAR_RCD_HOME="$T/home"
 export AFAR_RCD_LOG_DIR="$T/logs"
 export AFAR_RCD_AGENTS_DIR="$T/agents"
-export AFAR_RCD_LABEL_PREFIX="com.github.afar-rcd.selftest"
+export AFAR_RCD_LABEL_PREFIX="com.github.johannesreich1.afar-rcd.selftest"
 export AFAR_RCD_NOTIFY=log
 export AFAR_RCD_BACKOFF_MIN=1 AFAR_RCD_BACKOFF_MAX=2 AFAR_RCD_STABLE_AFTER=3
 export AFAR_RCD_RECHECK=2 AFAR_RCD_SETUP_GRACE=1 AFAR_RCD_LOGIN_POLL=1 AFAR_RCD_STOP_TIMEOUT=3

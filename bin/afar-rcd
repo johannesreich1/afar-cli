@@ -17,7 +17,7 @@
 
 set -u
 
-RCD_VERSION="0.1.0"
+RCD_VERSION="0.2.0"
 PROG=${0##*/}
 
 # ---------------------------------------------------------------- settings ---
@@ -25,7 +25,7 @@ PROG=${0##*/}
 RCD_HOME=${AFAR_RCD_HOME:-$HOME/.config/afar-rcd}
 RCD_LOG_DIR=${AFAR_RCD_LOG_DIR:-$HOME/Library/Logs/afar-rcd}
 RCD_AGENTS_DIR=${AFAR_RCD_AGENTS_DIR:-$HOME/Library/LaunchAgents}
-RCD_LABEL_PREFIX=${AFAR_RCD_LABEL_PREFIX:-com.github.afar-rcd}
+RCD_LABEL_PREFIX=${AFAR_RCD_LABEL_PREFIX:-com.github.johannesreich1.afar-rcd}
 RCD_NOTIFY=${AFAR_RCD_NOTIFY:-1}
 
 # Supervisor timing, in seconds.
