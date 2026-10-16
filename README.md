@@ -51,7 +51,12 @@ cd afar-rcd
 afar-rcd add ~/Projects/my-app
 ```
 
-The first time, Remote Control asks **"Enable Remote Control? (y/n)"** (and, for a folder Claude Code has never opened, whether to trust it). afar-rcd runs it in your terminal so you can answer **y**, then hands over to the background service:
+The first time, Remote Control asks a few one-time questions. afar-rcd runs it in your terminal so you can answer them, then hands over to the background service:
+
+- **"Trust ~/Projects/my-app?"**, only for a folder Claude Code has never opened: answer **y**.
+- **"Enable Remote Control? (y/n)"**: answer **y**.
+
+Claude Code doesn't ask for a spawn mode ("Choose [1/2]"), because afar-rcd always passes one (see [Spawn mode](#spawn-mode)). Then you see:
 
 ```text
 ✔ Added 'my-app' for ~/Projects/my-app
@@ -74,6 +79,7 @@ Open the **Code** tab in the Claude app on your phone, or [claude.ai/code](https
 | `afar-rcd stop NAME` | Stop a service. It stays stopped, even after a restart, until you start it |
 | `afar-rcd start NAME` | Start a stopped service |
 | `afar-rcd restart NAME` | Restart a service |
+| `afar-rcd spawn [NAME] [same-dir\|worktree]` | Show or set where new sessions work (see [Spawn mode](#spawn-mode)) |
 | `afar-rcd setup [NAME]` | Answer Remote Control's one-time questions for a service |
 | `afar-rcd remove NAME` | Stop a service and delete it |
 | `afar-rcd doctor` | Check Claude Code, your sign-in and every service |
@@ -83,15 +89,15 @@ Open the **Code** tab in the Claude app on your phone, or [claude.ai/code](https
 ### Options for `add`
 
 ```bash
-afar-rcd add ~/Projects/my-app --name app --keep-awake ac -- --spawn worktree
+afar-rcd add ~/Projects/my-app --name app --keep-awake ac --spawn worktree -- --capacity 4
 ```
 
 - `--name NAME`: service name (default: made from the folder name).
 - `--keep-awake always|ac|off`: `always` (default) stops idle sleep, on battery too. `ac` keeps the Mac awake only while it is on power. `off` lets it sleep as usual. Remote Control reconnects after the Mac wakes up.
+- `--spawn same-dir|worktree`: where new sessions work (default: `same-dir`, see [Spawn mode](#spawn-mode)).
 - `--no-start`: install the service without starting it.
 - `--yes`: answer yes to questions, such as installing Claude Code.
 - `-- ARGS...`: passed to `claude remote-control`, for example:
-  - `--spawn worktree` gives each new session its own git worktree, so parallel sessions don't edit the same files.
   - `--capacity 4` limits how many sessions run at once.
   - `--permission-mode acceptEdits` sets the permission mode for new sessions.
   - `--name "My app"` names the first session.
@@ -99,6 +105,20 @@ afar-rcd add ~/Projects/my-app --name app --keep-awake ac -- --spawn worktree
   Run `claude remote-control --help` for the full list.
 
 To change a service later, edit its config in `~/.config/afar-rcd/services/NAME.conf`, then run `afar-rcd restart NAME`.
+
+### Spawn mode
+
+The spawn mode decides where sessions you start from the Claude app or claude.ai/code work. It applies to all sessions of a service, not one at a time:
+
+- `same-dir` (the default): every session works in the folder itself, on the same files.
+- `worktree`: each new session gets its own git worktree under `.claude/worktrees`, on its own branch, so parallel sessions can't edit each other's files. Their changes stay on that branch until you merge them. It needs a git repository.
+
+```bash
+afar-rcd spawn my-app            # prints the mode
+afar-rcd spawn my-app worktree   # sets it
+```
+
+Setting it restarts the service if it is running, which interrupts its connected sessions for a few seconds. afar-rcd always passes the mode to `claude remote-control`, so Claude Code never asks "Choose [1/2]". A service added before 0.3.0 keeps the mode Claude Code saved for its folder, if any, else `same-dir`. `status NAME` and `status --json` show the mode.
 
 ## How it works
 
@@ -162,11 +182,11 @@ afar-rcd doctor
 `afar-rcd status --json` (or `status NAME --json`) prints one JSON object, for example for a menu bar app:
 
 ```json
-{"schema": 1, "version": "0.2.0", "services": [{
+{"schema": 1, "version": "0.3.0", "services": [{
   "name": "my-app", "folder": "/Users/me/Projects/my-app", "state": "running",
   "connection": "Connected", "pid": 54892, "since": 1792160683,
   "url": "https://claude.ai/code?environment=env_...", "message": null,
-  "keep_awake": "always", "log": "/Users/me/Library/Logs/afar-rcd/my-app.log",
+  "keep_awake": "always", "spawn": "same-dir", "log": "/Users/me/Library/Logs/afar-rcd/my-app.log",
   "session_count": 1,
   "sessions": [{"id": "session_...", "name": "...", "url": "https://claude.ai/code/session_...",
                 "status": "busy", "since": 1792161505, "pid": 54971}]
@@ -175,6 +195,7 @@ afar-rcd doctor
 
 - `state` is one of `running`, `starting`, `restarting`, `needs-setup`, `needs-login`, `error` or `stopped`. `needs-login` can appear while claude still runs (see [When something needs you](#when-something-needs-you)).
 - `connection` is `Connected`, `Connecting`, `Reconnecting` or `Disconnected` as claude reports it, or `null`.
+- `spawn` is the [spawn mode](#spawn-mode) the service runs with: `same-dir`, `worktree`, or `session` when it serves one session only. Added in 0.3.0.
 - `session_count` comes from claude's own status line. `sessions` is best effort: it reads Claude Code's per-session state files, which are internal to Claude Code and may change, so `status` values are passed through as-is (for example `busy` or `waiting`).
 - Times are Unix seconds, and unknown values are `null`. Within schema 1, fields are only ever added, never changed or removed. With no services, `services` is an empty list.
 

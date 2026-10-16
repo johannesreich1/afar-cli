@@ -17,7 +17,7 @@
 
 set -u
 
-RCD_VERSION="0.2.0"
+RCD_VERSION="0.3.0"
 PROG=${0##*/}
 
 # ---------------------------------------------------------------- settings ---
@@ -138,12 +138,13 @@ list_names() {
   done
 }
 
-# Loads a service config into RCD_DIR, RCD_KEEP_AWAKE, RCD_CLAUDE and RCD_ARGS.
+# Loads a service config into RCD_DIR, RCD_KEEP_AWAKE, RCD_CLAUDE, RCD_SPAWN
+# and RCD_ARGS. Configs from before 0.3.0 have no RCD_SPAWN.
 load_conf() {
   local conf
   conf=$(conf_of "$1")
   [ -f "$conf" ] || return 1
-  RCD_DIR='' RCD_KEEP_AWAKE=always RCD_CLAUDE=''
+  RCD_DIR='' RCD_KEEP_AWAKE=always RCD_CLAUDE='' RCD_SPAWN=''
   RCD_ARGS=()
   # shellcheck source=/dev/null
   . "$conf"
@@ -152,8 +153,8 @@ load_conf() {
 need_conf() { load_conf "$1" || die "no service named '$1' (see: $PROG status)"; }
 
 write_conf() {
-  local name=$1 dir=$2 awake=$3 claude=$4 conf a
-  shift 4
+  local name=$1 dir=$2 awake=$3 claude=$4 spawn=$5 conf a
+  shift 5
   conf=$(conf_of "$name")
   mkdir -p "${conf%/*}" || die "cannot create ${conf%/*}"
   {
@@ -161,11 +162,17 @@ write_conf() {
     printf 'RCD_DIR=%q\n' "$dir"
     printf 'RCD_KEEP_AWAKE=%q\n' "$awake"
     printf 'RCD_CLAUDE=%q\n' "$claude"
+    printf 'RCD_SPAWN=%q\n' "$spawn"
     printf 'RCD_ARGS=('
     for a in "$@"; do printf ' %q' "$a"; done
     printf ' )\n'
   } >"$conf.tmp" || die "cannot write $conf"
   mv -f "$conf.tmp" "$conf" || die "cannot write $conf"
+}
+
+# Writes the loaded config back for NAME.
+save_conf() {
+  write_conf "$1" "$RCD_DIR" "$RCD_KEEP_AWAKE" "$RCD_CLAUDE" "$RCD_SPAWN" ${RCD_ARGS[@]+"${RCD_ARGS[@]}"}
 }
 
 name_for_dir() {
@@ -359,6 +366,127 @@ function run(argv) {
   }
 }
 JXA
+}
+
+# Prints the root of the git repository FOLDER is in, or fails if it is in none.
+git_root() {
+  local d=$1
+  while [ -n "$d" ]; do
+    if [ -e "$d/.git" ]; then printf '%s\n' "$d"; return 0; fi
+    if [ "$d" = / ]; then return 1; fi
+    d=$(dirname "$d")
+  done
+  return 1
+}
+
+# Prints the spawn mode Claude Code saved for FOLDER (same-dir or worktree),
+# none if it saved none, or unknown. Claude Code saves it under the folder or
+# under the root of its git repository.
+spawn_state() {
+  /usr/bin/osascript -l JavaScript - "$CLAUDE_JSON" "$1" "$(git_root "$1")" 2>/dev/null <<'JXA' || printf 'unknown\n'
+ObjC.import('Foundation');
+function run(argv) {
+  var s = $.NSString.stringWithContentsOfFileEncodingError(argv[0], $.NSUTF8StringEncoding, null);
+  if (!s || s.isNil()) return 'unknown';
+  var cfg;
+  try { cfg = JSON.parse(s.js); } catch (e) { return 'unknown'; }
+  var projects = cfg.projects || {};
+  for (var i = 1; i < argv.length; i++) {
+    var mode = argv[i] && projects[argv[i]] && projects[argv[i]].remoteControlSpawnMode;
+    if (mode === 'same-dir' || mode === 'worktree') return mode;
+  }
+  return 'none';
+}
+JXA
+}
+
+# Prints the spawn mode given in RCD_ARGS, or fails if there is none.
+spawn_arg() {
+  local a next=''
+  for a in ${RCD_ARGS[@]+"${RCD_ARGS[@]}"}; do
+    if [ -n "$next" ]; then printf '%s\n' "$a"; return 0; fi
+    case $a in
+      --spawn) next=1 ;;
+      --spawn=*) printf '%s\n' "${a#--spawn=}"; return 0 ;;
+    esac
+  done
+  return 1
+}
+
+# Succeeds if RCD_ARGS resumes a session, which serves just that one session
+# and cannot be combined with --spawn.
+resume_arg() {
+  local a
+  for a in ${RCD_ARGS[@]+"${RCD_ARGS[@]}"}; do
+    case $a in -c | --continue | --session-id | --session-id=*) return 0 ;; esac
+  done
+  return 1
+}
+
+# Prints the spawn mode the loaded service runs with: same-dir, worktree or
+# session. In order: RCD_SPAWN, --spawn in RCD_ARGS, what Claude Code saved
+# for the folder, same-dir. afar-rcd always passes it to Claude Code, so
+# Claude Code never asks for one.
+service_spawn() {
+  local mode
+  if resume_arg; then printf 'session\n'; return 0; fi
+  if [ -n "${RCD_SPAWN-}" ]; then printf '%s\n' "$RCD_SPAWN"; return 0; fi
+  if spawn_arg; then return 0; fi
+  mode=$(spawn_state "$RCD_DIR")
+  # Claude Code itself ignores a saved worktree mode outside git.
+  if [ "$mode" != worktree ] || ! git_root "$RCD_DIR" >/dev/null; then mode=same-dir; fi
+  printf '%s\n' "$mode"
+}
+
+# Fills RUN_ARGS with the arguments for `claude remote-control`: --spawn with
+# the service's spawn mode, then RCD_ARGS without any --spawn of their own.
+build_run_args() {
+  local a skip=''
+  RUN_ARGS=()
+  if ! resume_arg; then RUN_ARGS=(--spawn "$(service_spawn)"); fi
+  for a in ${RCD_ARGS[@]+"${RCD_ARGS[@]}"}; do
+    if [ -n "$skip" ]; then skip=''; continue; fi
+    case $a in
+      --spawn) skip=1 ;;
+      --spawn=*) ;;
+      *) RUN_ARGS+=("$a") ;;
+    esac
+  done
+}
+
+# Sets the loaded service's spawn mode to MODE and drops any --spawn from
+# RCD_ARGS, so the config says it in one place.
+set_spawn() {
+  local a skip='' args=()
+  RCD_SPAWN=$1
+  for a in ${RCD_ARGS[@]+"${RCD_ARGS[@]}"}; do
+    if [ -n "$skip" ]; then skip=''; continue; fi
+    case $a in
+      --spawn) skip=1 ;;
+      --spawn=*) ;;
+      *) args+=("$a") ;;
+    esac
+  done
+  RCD_ARGS=(${args[@]+"${args[@]}"})
+}
+
+# Fails with a message unless MODE is a spawn mode that works in FOLDER.
+check_spawn() {
+  case $1 in
+    same-dir) ;;
+    worktree) git_root "$2" >/dev/null || die "worktree mode needs a git repository, and $(tilde "$2") is not in one" ;;
+    *) die "spawn mode must be same-dir or worktree, not '$1'" ;;
+  esac
+}
+
+# Describes a spawn mode for people.
+spawn_text() {
+  case $1 in
+    same-dir) printf 'same-dir: new sessions work in the folder itself, on the same files' ;;
+    worktree) printf 'worktree: each new session gets its own git worktree under .claude/worktrees, on its own branch' ;;
+    session)  printf 'session: serves one session only' ;;
+    *)        printf '%s' "$1" ;;
+  esac
 }
 
 # Fills SVC_ENV with an `env -i` command line that gives a program about the
@@ -881,16 +1009,17 @@ cmd_run() {
     started=$(date +%s)
     offset=$(file_size "$SUP_LOG")
     rm -f "$(alert_of "$name")"
-    log "starting claude remote-control${RCD_ARGS[*]+ ${RCD_ARGS[*]}} in $RCD_DIR"
+    build_run_args
+    log "starting claude remote-control${RUN_ARGS[*]+ ${RUN_ARGS[*]}} in $RCD_DIR"
     rm -f "$SUP_FIFO"
     if mkfifo "$SUP_FIFO" 2>/dev/null; then
       filtered=1
       log_filter "$SUP_LOG" <"$SUP_FIFO" &
       FILTER_PID=$!
-      "$CLAUDE_BIN" remote-control ${RCD_ARGS[@]+"${RCD_ARGS[@]}"} </dev/null >"$SUP_FIFO" 2>&1 &
+      "$CLAUDE_BIN" remote-control ${RUN_ARGS[@]+"${RUN_ARGS[@]}"} </dev/null >"$SUP_FIFO" 2>&1 &
     else
       filtered=0
-      "$CLAUDE_BIN" remote-control ${RCD_ARGS[@]+"${RCD_ARGS[@]}"} </dev/null &
+      "$CLAUDE_BIN" remote-control ${RUN_ARGS[@]+"${RUN_ARGS[@]}"} </dev/null &
     fi
     CHILD_PID=$!
     printf '%s\n' "$CHILD_PID" >"$(pid_of "$name")"
@@ -985,22 +1114,39 @@ preflight() {
 
 # Interactive setup for a service: pause it, run the preflight, start it again.
 run_setup() {
-  local name=$1 dir t0 rc
+  local name=$1 dir t0 rc spawn
   need_conf "$name"
   dir=$RCD_DIR
   [ -t 0 ] && [ -t 1 ] || die "setup asks questions; run it in a terminal: $PROG setup $name"
   ensure_claude
   ensure_login
   svc_unload "$name"
+  # Save the spawn mode the service already runs with, so it stays that way.
+  # Passing it explicitly also keeps Claude Code from asking for one.
+  spawn=$(service_spawn)
+  if [ -z "$RCD_SPAWN" ] && [ "$spawn" != session ] && ! spawn_arg >/dev/null; then
+    RCD_SPAWN=$spawn
+    save_conf "$name"
+  fi
+  build_run_args
   say ""
   info "Starting Remote Control in $(tilde "$dir") so you can answer its one-time questions."
-  say "    Answer ${C_BOLD}y${C_OFF} to \"Enable Remote Control?\" (and to trusting the folder, if asked)."
+  say "    Claude Code may ask:"
+  if [ "$(trust_state "$dir")" != yes ]; then
+    say "      ${C_BOLD}Trust $(tilde "$dir")?${C_OFF}  Answer ${C_BOLD}y${C_OFF}."
+  fi
+  say "      ${C_BOLD}Enable Remote Control?${C_OFF}  Answer ${C_BOLD}y${C_OFF}."
   say "    Once it is running, $PROG closes it here and hands over to the background service."
   say "    (If it does not close within a few seconds of showing the session link, press Ctrl+C.)"
   say ""
-  if preflight "$dir" ${RCD_ARGS[@]+"${RCD_ARGS[@]}"}; then
+  if preflight "$dir" ${RUN_ARGS[@]+"${RUN_ARGS[@]}"}; then
     say ""
     ok "Remote Control is enabled for $(tilde "$dir")."
+    say "  Spawn mode is $(spawn_text "$spawn")."
+    case $spawn in
+      same-dir) say "  To give each session its own worktree instead, run: $PROG spawn $name worktree" ;;
+      worktree) say "  To have sessions work in the folder itself instead, run: $PROG spawn $name same-dir" ;;
+    esac
     t0=$(date +%s)
     svc_start "$name"
     wait_ready "$name" 45 "$t0"
@@ -1026,10 +1172,11 @@ Commands:
   add [FOLDER]        Serve FOLDER (default: current folder) as a background service
       -n, --name NAME           service name (default: from the folder name)
       -a, --keep-awake MODE     always (default), ac (only on power) or off
+      -s, --spawn MODE          same-dir (default) or worktree, see 'spawn'
           --no-start            only install, do not start now
       -y, --yes                 answer yes to questions (installing Claude Code)
       -- ARGS...                extra arguments for 'claude remote-control',
-                                for example: -- --spawn worktree
+                                for example: -- --capacity 4
   remove NAME|--all   Stop a service and remove it
   start  NAME|--all   Start a service (and start it at login again)
   stop   NAME|--all   Stop a service and keep it stopped, even after a restart
@@ -1039,6 +1186,9 @@ Commands:
   logs NAME [-f] [-n LINES]
                       Show a service's log (-f to follow)
   open [NAME]         Open the service's session in the browser
+  spawn [NAME] [MODE] Show or set where new sessions work, and restart if running:
+                      same-dir (in the folder itself) or worktree (each in
+                      its own git worktree, on its own branch)
   setup [NAME]        Answer Remote Control's one-time questions for a service
   doctor              Check that everything needed is installed and working
   version             Print the version
@@ -1049,13 +1199,15 @@ EOF
 }
 
 cmd_add() {
-  local dir='' name='' awake=always start=1 args=() existing
+  local dir='' name='' awake=always spawn='' start=1 args=() existing
   while [ $# -gt 0 ]; do
     case "$1" in
       -n | --name) [ $# -ge 2 ] || die "$1 needs a value"; name=$2; shift 2 ;;
       --name=*) name=${1#*=}; shift ;;
       -a | --keep-awake) [ $# -ge 2 ] || die "$1 needs a value"; awake=$2; shift 2 ;;
       --keep-awake=*) awake=${1#*=}; shift ;;
+      -s | --spawn) [ $# -ge 2 ] || die "$1 needs a value"; spawn=$2; shift 2 ;;
+      --spawn=*) spawn=${1#*=}; shift ;;
       --no-start) start=0; shift ;;
       -y | --yes) RCD_ASSUME_YES=1; shift ;;
       -h | --help) usage; return 0 ;;
@@ -1071,6 +1223,13 @@ cmd_add() {
     die "pick a project folder: Claude Code never saves trust for $(tilde "$dir"), so it cannot run unattended there"
   fi
   case "$awake" in always | ac | off) ;; *) die "--keep-awake must be always, ac or off" ;; esac
+  if [ -n "$spawn" ]; then
+    check_spawn "$spawn" "$dir"
+  else
+    # New services start in same-dir, unless --spawn comes with the extra arguments.
+    RCD_ARGS=(${args[@]+"${args[@]}"})
+    spawn_arg >/dev/null || spawn=same-dir
+  fi
   if existing=$(name_for_dir "$dir"); then
     die "$(tilde "$dir") is already served by '$existing' (see: $PROG status $existing)"
   fi
@@ -1084,7 +1243,7 @@ cmd_add() {
     warn "Claude Code does not trust $(tilde "$dir") yet; the service will wait until you run: $PROG setup $name"
   fi
 
-  write_conf "$name" "$dir" "$awake" "$CLAUDE_BIN" ${args[@]+"${args[@]}"}
+  write_conf "$name" "$dir" "$awake" "$CLAUDE_BIN" "$spawn" ${args[@]+"${args[@]}"}
   write_plist "$name"
   ok "Added '$name' for $(tilde "$dir")"
   if [ "$start" = 1 ]; then
@@ -1146,6 +1305,37 @@ do_restart() {
   report "$1" "$rc"
 }
 
+# `spawn [NAME] [MODE]`: prints the spawn mode, or sets it. Setting it
+# restarts claude if it is running, without waiting for it to come back;
+# otherwise the supervisor picks it up the next time it starts claude.
+cmd_spawn() {
+  local n mode cur
+  case $# in
+    0) ;;
+    1) case $1 in same-dir | worktree | session) [ -f "$(conf_of "$1")" ] || set -- '' "$1" ;; esac ;;
+    2) ;;
+    *) die "usage: $PROG spawn [NAME] [same-dir|worktree]" ;;
+  esac
+  n=$(resolve_name "${1-}") || exit 1
+  need_conf "$n"
+  cur=$(service_spawn)
+  if [ $# -lt 2 ]; then printf '%s\n' "$cur"; return 0; fi
+  mode=$2
+  check_spawn "$mode" "$RCD_DIR"
+  set_spawn "$mode"
+  save_conf "$n"
+  if [ "$cur" = "$mode" ]; then ok "'$n' already uses $(spawn_text "$mode")"; return 0; fi
+  svc_status "$n"
+  case $S_STATE in
+    running | starting | needs-login) # claude may be running with the old mode
+      note_sessions "$n" "they reconnect in a few seconds"
+      svc_restart "$n"
+      ok "'$n' now uses $(spawn_text "$mode"). It is restarting."
+      ;;
+    *) ok "'$n' now uses $(spawn_text "$mode")." ;;
+  esac
+}
+
 fmt_dur() {
   local s=$1
   if [ "$s" -ge 86400 ]; then printf '%dd%dh' $((s / 86400)) $((s % 86400 / 3600))
@@ -1196,8 +1386,9 @@ service_json() {
   printf '{"name":%s,"folder":%s,"state":%s,"connection":%s,"pid":%s,"since":%s,"url":%s,"message":%s,' \
     "$(json_str "$n")" "$(json_str "$RCD_DIR")" "$(json_str "$S_STATE")" "$(json_str "$S_CONN")" \
     "$(json_num "$S_PID")" "$(json_num "$ST_SINCE")" "$(json_str "$S_URL")" "$(json_str "$msg")"
-  printf '"keep_awake":%s,"log":%s,"session_count":%s,"sessions":%s}' \
-    "$(json_str "$RCD_KEEP_AWAKE")" "$(json_str "$(log_of "$n")")" "$(json_num "$S_SESSIONS")" "${sessions:-[]}"
+  printf '"keep_awake":%s,"spawn":%s,"log":%s,"session_count":%s,"sessions":%s}' \
+    "$(json_str "$RCD_KEEP_AWAKE")" "$(json_str "$(service_spawn)")" "$(json_str "$(log_of "$n")")" \
+    "$(json_num "$S_SESSIONS")" "${sessions:-[]}"
 }
 
 # Machine-readable status, for tools such as a menu bar app. The format is
@@ -1248,6 +1439,7 @@ cmd_status() {
       say "  message:     $ST_MESSAGE"
     fi
     say "  keep awake:  $RCD_KEEP_AWAKE"
+    say "  spawn mode:  $(spawn_text "$(service_spawn)")"
     say "  arguments:   remote-control${RCD_ARGS[*]+ ${RCD_ARGS[*]}}"
     say "  launchd:     $DOMAIN/$(label_of "$n")$(is_disabled "$n" && printf ' (disabled)')"
     say "  log:         $(tilde "$(log_of "$n")")"
@@ -1383,6 +1575,7 @@ main() {
     logs | log) cmd_logs "$@" ;;
     open) cmd_open "$@" ;;
     setup) init_domain; cmd_setup "$@" ;;
+    spawn) init_domain; cmd_spawn "$@" ;;
     doctor) init_domain; cmd_doctor ;;
     *) usage >&2; die "unknown command: $cmd" ;;
   esac

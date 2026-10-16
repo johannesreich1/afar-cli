@@ -1,5 +1,13 @@
 # Changelog
 
+## 0.3.0 - 2026-10-17
+
+- Each service has a spawn mode: `same-dir` (the default for new services) or `worktree`. afar-rcd always passes it to `claude remote-control`, so Claude Code no longer asks "Choose [1/2]" during setup.
+- `afar-rcd spawn NAME [same-dir|worktree]` shows or sets it, and restarts the service if it is running. `add --spawn MODE` sets it for a new service.
+- Services added before 0.3.0 keep the mode Claude Code saved for their folder. `setup` writes it into the service's config.
+- `status NAME` shows the spawn mode, and `status --json` has a new `spawn` field (schema 1).
+- `setup` only lists the trust question when the folder isn't trusted yet.
+
 ## 0.2.0 - 2026-10-16
 
 - launchd labels moved to com.github.johannesreich1.afar-rcd.NAME, like Afar's bundle id.

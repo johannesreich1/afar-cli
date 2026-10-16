@@ -114,6 +114,30 @@ check "xml_escape escapes markup" [ "$(lib 'xml_escape "a&b<c>"')" = "a&amp;b&lt
 check "valid_name rejects slashes" lib '! valid_name "a/b" && valid_name "ok.name-1_x"'
 check "trust_state sees a trusted parent folder" [ "$(lib "trust_state '$T/projects/x'")" = yes ]
 check "trust_state sees an untrusted folder" [ "$(lib "trust_state /usr")" = no ]
+mkdir -p "$T/repo/.git" "$T/repo/sub" "$T/repo2/.git" "$T/plain"
+printf '{"projects": {"%s": {"remoteControlSpawnMode": "worktree"}, "%s": {"remoteControlSpawnMode": "worktree"}}}\n' \
+  "$T/repo" "$T/plain" >"$T/spawn.json"
+spawn_lib() { lib "CLAUDE_JSON='$T/spawn.json'; $1"; }
+check "git_root finds the repository of a subfolder" [ "$(lib "git_root '$T/repo/sub'")" = "$T/repo" ]
+check "git_root fails outside a repository" lib "! git_root '$T/plain'"
+check "spawn_state reads the saved spawn mode" [ "$(spawn_lib "spawn_state '$T/repo'")" = worktree ]
+check "spawn_state uses the repository's saved mode for a subfolder" [ "$(spawn_lib "spawn_state '$T/repo/sub'")" = worktree ]
+check "spawn_state says none when nothing is saved" [ "$(spawn_lib "spawn_state '$T/repo2'")" = none ]
+check "spawn_arg finds --spawn MODE" [ "$(lib "RCD_ARGS=(--capacity 4 --spawn worktree); spawn_arg")" = worktree ]
+check "spawn_arg finds --spawn=MODE" [ "$(lib "RCD_ARGS=(--spawn=same-dir); spawn_arg")" = same-dir ]
+check "spawn_arg fails without --spawn" lib "RCD_ARGS=(--capacity 4); ! spawn_arg"
+check "service_spawn: RCD_SPAWN wins over arguments and the saved mode" [ "$(spawn_lib "RCD_SPAWN=same-dir RCD_DIR='$T/repo' RCD_ARGS=(--spawn worktree); service_spawn")" = same-dir ]
+check "service_spawn: an argument wins over the saved mode" [ "$(spawn_lib "RCD_DIR='$T/repo' RCD_ARGS=(--spawn same-dir); service_spawn")" = same-dir ]
+check "service_spawn: without either, the saved mode counts" [ "$(spawn_lib "RCD_DIR='$T/repo' RCD_ARGS=(); service_spawn")" = worktree ]
+check "service_spawn: an unsaved repository uses same-dir" [ "$(spawn_lib "RCD_DIR='$T/repo2' RCD_ARGS=(); service_spawn")" = same-dir ]
+check "service_spawn: a saved worktree mode outside git uses same-dir" [ "$(spawn_lib "RCD_DIR='$T/plain' RCD_ARGS=(); service_spawn")" = same-dir ]
+check "service_spawn: resuming a session is session mode" [ "$(spawn_lib "RCD_SPAWN=worktree RCD_DIR='$T/repo' RCD_ARGS=(--continue); service_spawn")" = session ]
+check "build_run_args passes the spawn mode first and drops other --spawn" \
+  [ "$(spawn_lib "RCD_SPAWN=worktree RCD_DIR='$T/repo' RCD_ARGS=(--capacity 4 --spawn same-dir --spawn=session); build_run_args; echo \"\${RUN_ARGS[*]}\"")" = "--spawn worktree --capacity 4" ]
+check "build_run_args leaves --spawn out when resuming" \
+  [ "$(spawn_lib "RCD_SPAWN=same-dir RCD_DIR='$T/repo' RCD_ARGS=(--session-id x); build_run_args; echo \"\${RUN_ARGS[*]}\"")" = "--session-id x" ]
+check "set_spawn moves the mode out of the arguments" \
+  [ "$(lib "RCD_SPAWN='' RCD_ARGS=(--spawn=worktree --capacity 4 --spawn same-dir); set_spawn worktree; echo \"\$RCD_SPAWN \${RCD_ARGS[*]}\"")" = "worktree --capacity 4" ]
 rm -f "$T/rot.log" "$T/rot.log.1"
 seq 1 400 | sed 's/^/unique line /' | AFAR_RCD_LOG_MAX_BYTES=2000 lib "log_filter '$T/rot.log'"
 check "log_filter rotates a log that grows too big" [ -f "$T/rot.log.1" ] && [ "$(stat -f %z "$T/rot.log")" -le 2000 ]
@@ -142,7 +166,9 @@ check "launchd plist is valid" plutil -lint "$AFAR_RCD_AGENTS_DIR/$AFAR_RCD_LABE
 check "agent is loaded in launchd" loaded my-project
 wait_for 10 "claude is running" state_is my-project running
 PID1=$(child my-project)
-check "claude runs in the service folder" grep -q "^$PID1 start mode=serve args= cwd=$P1\$" "$FAKE/events"
+check "claude runs in the service folder, in same-dir mode" grep -q "^$PID1 start mode=serve args=--spawn same-dir cwd=$P1\$" "$FAKE/events"
+check "add saves same-dir as the spawn mode" grep -qx 'RCD_SPAWN=same-dir' "$AFAR_RCD_HOME/services/my-project.conf"
+check "status --json shows the spawn mode" [ "$(jsonq 'j.services[0].spawn' my-project)" = same-dir ]
 wait_for 5 "caffeinate keeps the Mac awake while claude runs" caffeinated i "$PID1"
 check "status lists the service as running" sh -c "'$TOOL' status | grep -q '^my-project  *running  *$PID1'"
 check "status NAME shows the environment link" sh -c "'$TOOL' status my-project | grep -q 'session: *https://claude.ai/code?environment=env_fake$PID1'"
@@ -317,6 +343,26 @@ check "the leftover claude was stopped" event_for "$PID10" "got SIGINT"
 check "only one claude is running" one_fake
 wait_for 10 "the killed supervisor's helpers stop too" sh -c "for p in $HELPERS; do ! kill -0 \$p 2>/dev/null || exit 1; done"
 
+section "spawn mode"
+check "spawn NAME prints the spawn mode" [ "$(rcd spawn my-project)" = same-dir ]
+check "spawn refuses an unknown mode" sh -c "! '$TOOL' spawn my-project bogus </dev/null 2>/dev/null"
+check "spawn refuses worktree outside git, with an error line" \
+  sh -c "! '$TOOL' spawn my-project worktree </dev/null 2>'$T/spawn.err' && grep -q '^error: worktree mode needs a git repository' '$T/spawn.err'"
+check "add refuses worktree outside git" sh -c "! '$TOOL' add '$T/plain' --spawn worktree --no-start </dev/null 2>/dev/null"
+mkdir -p "$P1/.git"
+PIDS=$(child my-project)
+if rcd spawn my-project worktree </dev/null >"$T/spawn.out" 2>&1; then pass "spawn switches to worktree"; else fail "spawn switches to worktree"; cat "$T/spawn.out"; fi
+check "spawn saves the mode" grep -qx 'RCD_SPAWN=worktree' "$AFAR_RCD_HOME/services/my-project.conf"
+wait_for 15 "spawn restarts a running service" running_new my-project "$PIDS"
+PIDS=$(child my-project)
+check "claude restarts in worktree mode" grep -q "^$PIDS start mode=serve args=--spawn worktree cwd=$P1\$" "$FAKE/events"
+check "status --json shows the new spawn mode" [ "$(jsonq 'j.services[0].spawn' my-project)" = worktree ]
+check "spawn to the same mode succeeds" sh -c "'$TOOL' spawn my-project worktree </dev/null | grep -q 'already uses'"
+sleep 2
+check "spawn to the same mode does not restart" [ "$(child my-project)" = "$PIDS" ]
+rcd spawn my-project same-dir </dev/null >/dev/null 2>&1
+wait_for 15 "spawn switches back to same-dir" running_new my-project "$PIDS"
+
 section "second service with extra arguments"
 P2="$T/projects/second"
 mkdir -p "$P2"
@@ -324,12 +370,21 @@ if rcd add "$P2" --name two --keep-awake ac -- --spawn worktree --capacity 4 </d
 wait_for 10 "second service is running" state_is two running
 TWO=$(child two)
 check "arguments reach claude remote-control" grep -q "^$TWO start mode=serve args=--spawn worktree --capacity 4 cwd=$P2\$" "$FAKE/events"
+check "status shows the spawn mode from the arguments" sh -c "'$TOOL' status two | grep -q '^  spawn mode:  worktree: '"
 wait_for 5 "keep-awake ac uses caffeinate -s" caffeinated s "$TWO"
 check "status lists both services" [ "$("$TOOL" status | grep -c running)" -eq 2 ]
 check "status --json lists both services" [ "$(jsonq 'j.services.map(function (s) { return s.name }).join(",")')" = "my-project,two" ]
 check "a command without NAME asks which service" sh -c "! '$TOOL' logs 2>/dev/null"
 check "invalid names are refused" sh -c "! '$TOOL' add '$T' --name 'bad/name' </dev/null 2>/dev/null"
 check "duplicate names are refused" sh -c "! '$TOOL' add '$T' --name two </dev/null 2>/dev/null"
+rcd stop two </dev/null >/dev/null 2>&1
+check "spawn on a stopped service succeeds" sh -c "'$TOOL' spawn two same-dir </dev/null >/dev/null"
+check "spawn leaves a stopped service stopped" not_loaded two
+check "spawn moves the mode out of the arguments" \
+  sh -c "grep -qx 'RCD_SPAWN=same-dir' '$AFAR_RCD_HOME/services/two.conf' && grep -qx 'RCD_ARGS=( --capacity 4 )' '$AFAR_RCD_HOME/services/two.conf'"
+rcd start two </dev/null >/dev/null 2>&1
+wait_for 10 "second service runs again" state_is two running
+check "it starts with the new spawn mode" grep -q "^$(child two) start mode=serve args=--spawn same-dir --capacity 4 cwd=$P2\$" "$FAKE/events"
 
 section "doctor"
 check "doctor passes" sh -c "'$TOOL' doctor </dev/null"
