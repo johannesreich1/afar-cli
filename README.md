@@ -29,6 +29,14 @@ curl -fsSL https://raw.githubusercontent.com/johannesreich1/afar-rcd/main/instal
 
 This puts `afar-rcd` in `~/.local/bin` (the same place Claude Code's installer uses) and then runs `afar-rcd doctor`, which checks for Claude Code and your sign-in and offers to fix what is missing.
 
+With Homebrew (this repository is also its tap):
+
+```bash
+brew tap johannesreich1/afar-rcd https://github.com/johannesreich1/afar-rcd
+brew install afar-rcd
+afar-rcd doctor
+```
+
 From a clone:
 
 ```bash
@@ -183,6 +191,13 @@ curl -fsSL https://raw.githubusercontent.com/johannesreich1/afar-rcd/main/instal
 ```
 
 or `./install.sh --uninstall` from a clone. This stops and removes every service, then deletes `afar-rcd`. Claude Code itself stays installed.
+
+With Homebrew, remove the services first, since `brew uninstall` leaves them running:
+
+```bash
+afar-rcd remove --all
+brew uninstall afar-rcd
+```
 
 ## Alternatives
 
