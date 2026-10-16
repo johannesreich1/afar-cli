@@ -309,10 +309,13 @@ PID10=$(child my-project)
 section "supervisor killed outright"
 SUP=$(launchctl print "$(domain)/$AFAR_RCD_LABEL_PREFIX.my-project" | awk '$1 == "pid" { print $3; exit }')
 check "launchd knows the supervisor pid" [ -n "$SUP" ]
+HELPERS=$(pgrep -P "$SUP" -f "_run my-project" | tr '\n' ' ')
+check "the supervisor runs its helpers" [ -n "$HELPERS" ]
 kill -KILL "$SUP"
 wait_for 30 "launchd starts a new supervisor and claude" running_new my-project "$PID10"
 check "the leftover claude was stopped" event_for "$PID10" "got SIGINT"
 check "only one claude is running" one_fake
+wait_for 10 "the killed supervisor's helpers stop too" sh -c "for p in $HELPERS; do ! kill -0 \$p 2>/dev/null || exit 1; done"
 
 section "second service with extra arguments"
 P2="$T/projects/second"

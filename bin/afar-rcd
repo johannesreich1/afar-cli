@@ -686,11 +686,13 @@ read_alert() {
 # Runs next to claude. Every RCD_WATCH_INTERVAL seconds it reads claude's new
 # output for sign-in problems, so they show in `status` and as a notification
 # while claude keeps running (it warns about a day before it stops). Clears
-# the warning once the saved sign-in changes.
+# the warning once the saved sign-in changes. Stops by itself when its
+# supervisor is gone, for example after a SIGKILL.
 watch_signin() {
-  local name=$1 offset=$2 alert size msg
+  local name=$1 offset=$2 sup=$$ alert size msg
   alert=$(alert_of "$name")
   while sleep "$RCD_WATCH_INTERVAL"; do
+    kill -0 "$sup" 2>/dev/null || return 0
     size=$(file_size "$SUP_LOG")
     if [ "$size" -lt "$offset" ]; then offset=0; fi
     msg=$(tail -c +"$((offset + 1))" "$SUP_LOG" 2>/dev/null | grep -F '[claude] ' | grep -E "$RE_LOGIN" |
