@@ -1,55 +1,55 @@
 #!/bin/bash
 #
-# afar-rcd - keep `claude remote-control` running in the background on macOS.
+# afar-cli - keep `claude remote-control` running in the background on macOS.
 #
 # Each service is a per-user launchd agent that runs a small supervisor
-# (`afar-rcd _run NAME`). The supervisor starts `claude remote-control` in the
+# (`afar-cli _run NAME`). The supervisor starts `claude remote-control` in the
 # service's folder, keeps the Mac awake with caffeinate while it runs, and
 # restarts it with backoff whenever it exits. launchd starts the supervisor at
 # login and restarts it if it dies.
 #
 # Only tools that ship with macOS are used (bash 3.2, launchctl, caffeinate,
 # osascript, plutil, script). The one dependency is the Claude Code CLI, which
-# `afar-rcd add` and `afar-rcd doctor` check for and offer to install.
+# `afar-cli add` and `afar-cli doctor` check for and offer to install.
 #
-# https://github.com/johannesreich1/afar-rcd - MIT License.
+# https://github.com/johannesreich1/afar-cli - MIT License.
 # Not affiliated with or endorsed by Anthropic.
 
 set -u
 
-RCD_VERSION="0.3.0"
+RCD_VERSION="0.4.0"
 PROG=${0##*/}
 
 # ---------------------------------------------------------------- settings ---
 
-RCD_HOME=${AFAR_RCD_HOME:-$HOME/.config/afar-rcd}
-RCD_LOG_DIR=${AFAR_RCD_LOG_DIR:-$HOME/Library/Logs/afar-rcd}
-RCD_AGENTS_DIR=${AFAR_RCD_AGENTS_DIR:-$HOME/Library/LaunchAgents}
-RCD_LABEL_PREFIX=${AFAR_RCD_LABEL_PREFIX:-com.github.johannesreich1.afar-rcd}
-RCD_NOTIFY=${AFAR_RCD_NOTIFY:-1}
+RCD_HOME=${AFAR_CLI_HOME:-$HOME/.config/afar-cli}
+RCD_LOG_DIR=${AFAR_CLI_LOG_DIR:-$HOME/Library/Logs/afar-cli}
+RCD_AGENTS_DIR=${AFAR_CLI_AGENTS_DIR:-$HOME/Library/LaunchAgents}
+RCD_LABEL_PREFIX=${AFAR_CLI_LABEL_PREFIX:-com.github.johannesreich1.afar-cli}
+RCD_NOTIFY=${AFAR_CLI_NOTIFY:-1}
 
 # Supervisor timing, in seconds.
-RCD_BACKOFF_MIN=${AFAR_RCD_BACKOFF_MIN:-5}       # first restart delay
-RCD_BACKOFF_MAX=${AFAR_RCD_BACKOFF_MAX:-300}     # longest restart delay
-RCD_STABLE_AFTER=${AFAR_RCD_STABLE_AFTER:-300}   # a run this long resets the backoff
-RCD_RECHECK=${AFAR_RCD_RECHECK:-600}             # retry interval while setup is needed
-RCD_LOGIN_POLL=${AFAR_RCD_LOGIN_POLL:-30}        # sign-in check interval while signed out
-RCD_SETUP_GRACE=${AFAR_RCD_SETUP_GRACE:-60}      # wait before notifying that setup is needed
-RCD_STOP_TIMEOUT=${AFAR_RCD_STOP_TIMEOUT:-20}    # time claude gets to exit after SIGINT
-RCD_LOG_MAX_BYTES=${AFAR_RCD_LOG_MAX_BYTES:-10485760}
-RCD_WATCH_INTERVAL=${AFAR_RCD_WATCH_INTERVAL:-30} # how often a running service checks claude's output
-RCD_LOGIN_RECHECK=${AFAR_RCD_LOGIN_RECHECK:-600}  # retry interval after a sign-in problem
-RCD_RENOTIFY=${AFAR_RCD_RENOTIFY:-21600}          # repeat a notification while a problem lasts
+RCD_BACKOFF_MIN=${AFAR_CLI_BACKOFF_MIN:-5}       # first restart delay
+RCD_BACKOFF_MAX=${AFAR_CLI_BACKOFF_MAX:-300}     # longest restart delay
+RCD_STABLE_AFTER=${AFAR_CLI_STABLE_AFTER:-300}   # a run this long resets the backoff
+RCD_RECHECK=${AFAR_CLI_RECHECK:-600}             # retry interval while setup is needed
+RCD_LOGIN_POLL=${AFAR_CLI_LOGIN_POLL:-30}        # sign-in check interval while signed out
+RCD_SETUP_GRACE=${AFAR_CLI_SETUP_GRACE:-60}      # wait before notifying that setup is needed
+RCD_STOP_TIMEOUT=${AFAR_CLI_STOP_TIMEOUT:-20}    # time claude gets to exit after SIGINT
+RCD_LOG_MAX_BYTES=${AFAR_CLI_LOG_MAX_BYTES:-10485760}
+RCD_WATCH_INTERVAL=${AFAR_CLI_WATCH_INTERVAL:-30} # how often a running service checks claude's output
+RCD_LOGIN_RECHECK=${AFAR_CLI_LOGIN_RECHECK:-600}  # retry interval after a sign-in problem
+RCD_RENOTIFY=${AFAR_CLI_RENOTIFY:-21600}          # repeat a notification while a problem lasts
 
 CLAUDE_INSTALL_URL="https://claude.ai/install.sh"
 CLAUDE_JSON="${CLAUDE_CONFIG_DIR:-$HOME}/.claude.json"
 
 # Variables copied into the launchd agent's environment when set, so the
 # service sees the same settings as the command that created it.
-PASS_ENV="AFAR_RCD_HOME AFAR_RCD_LOG_DIR AFAR_RCD_LABEL_PREFIX AFAR_RCD_NOTIFY
-AFAR_RCD_BACKOFF_MIN AFAR_RCD_BACKOFF_MAX AFAR_RCD_STABLE_AFTER AFAR_RCD_RECHECK
-AFAR_RCD_LOGIN_POLL AFAR_RCD_SETUP_GRACE AFAR_RCD_STOP_TIMEOUT AFAR_RCD_LOG_MAX_BYTES
-AFAR_RCD_WATCH_INTERVAL AFAR_RCD_LOGIN_RECHECK AFAR_RCD_RENOTIFY
+PASS_ENV="AFAR_CLI_HOME AFAR_CLI_LOG_DIR AFAR_CLI_LABEL_PREFIX AFAR_CLI_NOTIFY
+AFAR_CLI_BACKOFF_MIN AFAR_CLI_BACKOFF_MAX AFAR_CLI_STABLE_AFTER AFAR_CLI_RECHECK
+AFAR_CLI_LOGIN_POLL AFAR_CLI_SETUP_GRACE AFAR_CLI_STOP_TIMEOUT AFAR_CLI_LOG_MAX_BYTES
+AFAR_CLI_WATCH_INTERVAL AFAR_CLI_LOGIN_RECHECK AFAR_CLI_RENOTIFY
 CLAUDE_CONFIG_DIR HTTP_PROXY HTTPS_PROXY NO_PROXY ALL_PROXY http_proxy https_proxy no_proxy all_proxy"
 
 # What `claude remote-control` prints in the situations the supervisor handles.
@@ -158,7 +158,7 @@ write_conf() {
   conf=$(conf_of "$name")
   mkdir -p "${conf%/*}" || die "cannot create ${conf%/*}"
   {
-    printf '# afar-rcd service "%s". After editing, run: afar-rcd restart %s\n' "$name" "$name"
+    printf '# afar-cli service "%s". After editing, run: afar-cli restart %s\n' "$name" "$name"
     printf 'RCD_DIR=%q\n' "$dir"
     printf 'RCD_KEEP_AWAKE=%q\n' "$awake"
     printf 'RCD_CLAUDE=%q\n' "$claude"
@@ -336,7 +336,7 @@ session_titles() {
 
 find_claude() {
   local c
-  for c in "${AFAR_RCD_CLAUDE:-}" "${RCD_CLAUDE:-}" "$(command -v claude 2>/dev/null)" \
+  for c in "${AFAR_CLI_CLAUDE:-}" "${RCD_CLAUDE:-}" "$(command -v claude 2>/dev/null)" \
     "$HOME/.local/bin/claude" /opt/homebrew/bin/claude /usr/local/bin/claude "$HOME/.claude/local/claude"; do
     if [ -n "$c" ] && [ -x "$c" ] && [ ! -d "$c" ]; then printf '%s\n' "$c"; return 0; fi
   done
@@ -447,7 +447,7 @@ resume_arg() {
 
 # Prints the spawn mode the loaded service runs with: same-dir, worktree or
 # session. In order: RCD_SPAWN, --spawn in RCD_ARGS, what Claude Code saved
-# for the folder, same-dir. afar-rcd always passes it to Claude Code, so
+# for the folder, same-dir. afar-cli always passes it to Claude Code, so
 # Claude Code never asks for one.
 service_spawn() {
   local mode
@@ -529,8 +529,8 @@ build_service_env() {
 
 DOMAIN=''
 init_domain() {
-  if [ -n "${AFAR_RCD_DOMAIN:-}" ]; then
-    DOMAIN=$AFAR_RCD_DOMAIN
+  if [ -n "${AFAR_CLI_DOMAIN:-}" ]; then
+    DOMAIN=$AFAR_CLI_DOMAIN
   elif launchctl print "gui/$UID" >/dev/null 2>&1; then
     DOMAIN="gui/$UID"
   else
@@ -703,7 +703,7 @@ report() {
 
 # --------------------------------------------------------------- supervisor ---
 
-log() { printf '%s [afar-rcd] %s\n' "$(date '+%Y-%m-%d %H:%M:%S')" "$*" >>"$SUP_LOG"; }
+log() { printf '%s [afar-cli] %s\n' "$(date '+%Y-%m-%d %H:%M:%S')" "$*" >>"$SUP_LOG"; }
 
 # Copies claude's output to the log as plain lines. Even without a terminal,
 # claude redraws its status block every second; this drops lines already
@@ -779,7 +779,7 @@ finish_filter() {
   FILTER_PID=''
 }
 
-# Shows a macOS notification. AFAR_RCD_NOTIFY=0 turns them off; =log writes
+# Shows a macOS notification. AFAR_CLI_NOTIFY=0 turns them off; =log writes
 # them to run/notifications.log instead (used by the tests).
 notify() {
   case "$RCD_NOTIFY" in
@@ -806,7 +806,7 @@ notify_key() {
   notify_due "$1" "$2" || return 0
   f=$(notified_of "$1")
   { grep -v "^$2 " "$f" 2>/dev/null; printf '%s %s\n' "$2" "$(date +%s)"; } >"$f.tmp" && mv -f "$f.tmp" "$f"
-  notify "afar-rcd: $1" "$3"
+  notify "afar-cli: $1" "$3"
 }
 
 # Changes whenever Claude Code saves new sign-in details: a new login or a
@@ -982,7 +982,7 @@ problem() {
   set_state "$SUP_NAME" "$state" "$msg"
   if notify_due "$SUP_NAME" "$key"; then
     if [ "$key" = setup ]; then
-      # An interactive `afar-rcd add` usually runs setup within this time.
+      # An interactive `afar-cli add` usually runs setup within this time.
       sleep_wait "$RCD_SETUP_GRACE"
       wait=$((wait > RCD_SETUP_GRACE ? wait - RCD_SETUP_GRACE : 0))
     fi
@@ -1100,8 +1100,8 @@ cmd_run() {
 preflight() {
   local dir=$1 tl pidf watcher
   shift
-  tl=$(mktemp -t afar-rcd) || die "cannot create a temporary file"
-  pidf=$(mktemp -t afar-rcd) || die "cannot create a temporary file"
+  tl=$(mktemp -t afar-cli) || die "cannot create a temporary file"
+  pidf=$(mktemp -t afar-cli) || die "cannot create a temporary file"
   (
     while sleep 0.5; do
       p=$(cat "$pidf" 2>/dev/null)
@@ -1120,7 +1120,7 @@ preflight() {
     cd "$dir" || exit 1
     # The inner shell records claude's pid ($$ survives the exec) for the watcher.
     # shellcheck disable=SC2016 # $$ and $1 belong to the inner shell
-    /usr/bin/script -q -F "$tl" /bin/sh -c 'printf "%s" "$$" >"$1"; shift; exec "$@"' afar-rcd "$pidf" \
+    /usr/bin/script -q -F "$tl" /bin/sh -c 'printf "%s" "$$" >"$1"; shift; exec "$@"' afar-cli "$pidf" \
       "${SVC_ENV[@]}" "$CLAUDE_BIN" remote-control "$@"
   )
   kill "$watcher" 2>/dev/null
@@ -1518,7 +1518,7 @@ cmd_setup() {
 
 cmd_doctor() {
   local bad=0 v n self auth
-  say "${C_BOLD}afar-rcd $RCD_VERSION${C_OFF}"
+  say "${C_BOLD}afar-cli $RCD_VERSION${C_OFF}"
   ok "macOS $(sw_vers -productVersion 2>/dev/null), launchd domain $DOMAIN"
 
   self=$(self_path)
@@ -1603,4 +1603,4 @@ main() {
   esac
 }
 
-if [ "${AFAR_RCD_LIB:-0}" != 1 ]; then main "$@"; fi
+if [ "${AFAR_CLI_LIB:-0}" != 1 ]; then main "$@"; fi

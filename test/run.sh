@@ -1,6 +1,6 @@
 #!/bin/bash
 #
-# Tests for afar-rcd. They run real launchd agents, under their own label
+# Tests for afar-cli. They run real launchd agents, under their own label
 # prefix and in a temporary folder, with test/fake-claude standing in for the
 # Claude Code CLI, so they never touch your own services.
 #
@@ -9,19 +9,19 @@
 set -u
 
 ROOT=$(cd "$(dirname "$0")/.." && pwd -P)
-TOOL="$ROOT/bin/afar-rcd"
-T=$(mktemp -d -t afar-rcd-test) || exit 1
+TOOL="$ROOT/bin/afar-cli"
+T=$(mktemp -d -t afar-cli-test) || exit 1
 T=$(cd "$T" && pwd -P)
 
-export AFAR_RCD_HOME="$T/home"
-export AFAR_RCD_LOG_DIR="$T/logs"
-export AFAR_RCD_AGENTS_DIR="$T/agents"
-export AFAR_RCD_LABEL_PREFIX="com.github.johannesreich1.afar-rcd.selftest"
-export AFAR_RCD_NOTIFY=log
-export AFAR_RCD_BACKOFF_MIN=1 AFAR_RCD_BACKOFF_MAX=2 AFAR_RCD_STABLE_AFTER=3
-export AFAR_RCD_RECHECK=2 AFAR_RCD_SETUP_GRACE=1 AFAR_RCD_LOGIN_POLL=1 AFAR_RCD_STOP_TIMEOUT=3
-export AFAR_RCD_WATCH_INTERVAL=1 AFAR_RCD_LOGIN_RECHECK=8
-export AFAR_RCD_CLAUDE="$T/bin/claude"
+export AFAR_CLI_HOME="$T/home"
+export AFAR_CLI_LOG_DIR="$T/logs"
+export AFAR_CLI_AGENTS_DIR="$T/agents"
+export AFAR_CLI_LABEL_PREFIX="com.github.johannesreich1.afar-cli.selftest"
+export AFAR_CLI_NOTIFY=log
+export AFAR_CLI_BACKOFF_MIN=1 AFAR_CLI_BACKOFF_MAX=2 AFAR_CLI_STABLE_AFTER=3
+export AFAR_CLI_RECHECK=2 AFAR_CLI_SETUP_GRACE=1 AFAR_CLI_LOGIN_POLL=1 AFAR_CLI_STOP_TIMEOUT=3
+export AFAR_CLI_WATCH_INTERVAL=1 AFAR_CLI_LOGIN_RECHECK=8
+export AFAR_CLI_CLAUDE="$T/bin/claude"
 # Claude Code settings for the tests: trusts everything under $T.
 export CLAUDE_CONFIG_DIR="$T/claude-config"
 mkdir -p "$CLAUDE_CONFIG_DIR"
@@ -29,7 +29,7 @@ printf '{"projects": {"%s": {"hasTrustDialogAccepted": true}}}\n' "$T" >"$CLAUDE
 # Saved sign-in. `sign_in` changes it the way `claude auth login` would.
 printf '{}' >"$CLAUDE_CONFIG_DIR/.credentials.json"
 sign_in() { printf ' ' >>"$CLAUDE_CONFIG_DIR/.credentials.json"; }
-NOTES="$AFAR_RCD_HOME/run/notifications.log"
+NOTES="$AFAR_CLI_HOME/run/notifications.log"
 notes() { grep -c "$1" "$NOTES" 2>/dev/null || printf '0'; }
 
 FAKE="$T/fake"
@@ -70,12 +70,12 @@ jsonq() {
 first_session_busy() { [ "$(jsonq 'j.services[0].sessions.length > 0 && j.services[0].sessions[0].status' my-project)" = busy ]; }
 mode() { printf '%s\n' "$1" >"$FAKE/mode"; }
 # shellcheck source=/dev/null
-state() { (. "$AFAR_RCD_HOME/run/$1.state" 2>/dev/null && printf '%s' "$ST_STATE"); }
+state() { (. "$AFAR_CLI_HOME/run/$1.state" 2>/dev/null && printf '%s' "$ST_STATE"); }
 # shellcheck source=/dev/null
-child() { (. "$AFAR_RCD_HOME/run/$1.state" 2>/dev/null && printf '%s' "$ST_PID"); }
+child() { (. "$AFAR_CLI_HOME/run/$1.state" 2>/dev/null && printf '%s' "$ST_PID"); }
 state_is() { [ "$(state "$1")" = "$2" ]; }
 running_new() { state_is "$1" running && [ -n "$(child "$1")" ] && [ "$(child "$1")" != "$2" ] && kill -0 "$(child "$1")"; }
-loaded() { launchctl print "$(domain)/$AFAR_RCD_LABEL_PREFIX.$1" >/dev/null 2>&1; }
+loaded() { launchctl print "$(domain)/$AFAR_CLI_LABEL_PREFIX.$1" >/dev/null 2>&1; }
 not_loaded() { ! loaded "$1"; }
 domain() { if launchctl print "gui/$UID" >/dev/null 2>&1; then printf 'gui/%s' "$UID"; else printf 'user/%s' "$UID"; fi; }
 event_for() { grep -q "^$1 $2" "$FAKE/events" 2>/dev/null; }
@@ -88,10 +88,10 @@ caffeinated() { pgrep -f "caffeinate -$1 -w $2" >/dev/null; }
 
 cleanup() {
   local f
-  for f in "$AFAR_RCD_HOME"/services/*.conf; do
+  for f in "$AFAR_CLI_HOME"/services/*.conf; do
     [ -e "$f" ] || continue
     f=${f##*/}
-    launchctl bootout "$(domain)/$AFAR_RCD_LABEL_PREFIX.${f%.conf}" >/dev/null 2>&1
+    launchctl bootout "$(domain)/$AFAR_CLI_LABEL_PREFIX.${f%.conf}" >/dev/null 2>&1
   done
   pkill -f "$T/bin/claude remote-control" 2>/dev/null
   rm -rf "$T"
@@ -104,10 +104,10 @@ printf 'launchd domain: %s\n' "$(domain)"
 
 # ------------------------------------------------------------------------------
 section "helpers"
-lib() { AFAR_RCD_LIB=1 /bin/bash -c ". '$TOOL'; $1"; }
+lib() { AFAR_CLI_LIB=1 /bin/bash -c ". '$TOOL'; $1"; }
 check "default_name cleans up folder names" [ "$(lib 'default_name "/x/My Cool_Project!!"')" = "my-cool_project" ]
 check "default_name falls back for odd names" [ "$(lib 'default_name "/x/!!!"')" = "project" ]
-check "backoff doubles from the minimum" [ "$(lib 'AFAR_RCD_BACKOFF_MIN=5 AFAR_RCD_BACKOFF_MAX=300; RCD_BACKOFF_MIN=5 RCD_BACKOFF_MAX=300; backoff 3')" = 20 ]
+check "backoff doubles from the minimum" [ "$(lib 'AFAR_CLI_BACKOFF_MIN=5 AFAR_CLI_BACKOFF_MAX=300; RCD_BACKOFF_MIN=5 RCD_BACKOFF_MAX=300; backoff 3')" = 20 ]
 conn() { printf '%s\n' "$@" | lib connection_of; }
 check "a reconnect is not connected yet" [ "$(conn '2026-10-17 11:39:42 [claude] ·✔︎· Connected · afar · main' \
   '2026-10-17 11:58:28 [claude] ·|· Reconnecting · retrying in 2.4s · disconnected 0s')" = Reconnecting ]
@@ -146,7 +146,7 @@ check "build_run_args leaves --spawn out when resuming" \
 check "set_spawn moves the mode out of the arguments" \
   [ "$(lib "RCD_SPAWN='' RCD_ARGS=(--spawn=worktree --capacity 4 --spawn same-dir); set_spawn worktree; echo \"\$RCD_SPAWN \${RCD_ARGS[*]}\"")" = "worktree --capacity 4" ]
 rm -f "$T/rot.log" "$T/rot.log.1"
-seq 1 400 | sed 's/^/unique line /' | AFAR_RCD_LOG_MAX_BYTES=2000 lib "log_filter '$T/rot.log'"
+seq 1 400 | sed 's/^/unique line /' | AFAR_CLI_LOG_MAX_BYTES=2000 lib "log_filter '$T/rot.log'"
 check "log_filter rotates a log that grows too big" [ -f "$T/rot.log.1" ] && [ "$(stat -f %z "$T/rot.log")" -le 2000 ]
 check "log_filter keeps the newest lines" grep -q 'unique line 400$' "$T/rot.log"
 printf 'a \033]8;;https://x.test/1\007label\033]8;;\007 \033[1mbold\033[0m\n' | lib "log_filter '$T/esc.log'"
@@ -154,7 +154,7 @@ check "log_filter keeps link targets and strips escape codes" grep -q '\[claude\
 check "service_path has no duplicates" [ "$(lib 'PATH=/usr/bin:/bin:/usr/bin service_path' | tr ':' '\n' | sort | uniq -d | wc -l | tr -d ' ')" = 0 ]
 
 section "commands without services"
-check "version prints the version" sh -c "'$TOOL' version | grep -q '^afar-rcd [0-9]'"
+check "version prints the version" sh -c "'$TOOL' version | grep -q '^afar-cli [0-9]'"
 check "help lists the commands" sh -c "'$TOOL' help | grep -q 'add \\[FOLDER\\]'"
 check "status with no services says so" sh -c "'$TOOL' status | grep -q 'No services yet'"
 check "status --json with no services has an empty list" [ "$("$TOOL" status --json)" = '{"schema":1,"version":"'"$("$TOOL" version | cut -d' ' -f2)"'","services":[]}' ]
@@ -168,13 +168,13 @@ mkdir -p "$P1"
 mode serve
 if rcd add "$P1" </dev/null >"$T/add.out" 2>&1; then pass "add succeeds"; else fail "add succeeds"; cat "$T/add.out"; fi
 check "add reports the session link" grep -q 'https://claude.ai/code?environment=env_fake' "$T/add.out"
-check "config was written" [ -f "$AFAR_RCD_HOME/services/my-project.conf" ]
-check "launchd plist is valid" plutil -lint "$AFAR_RCD_AGENTS_DIR/$AFAR_RCD_LABEL_PREFIX.my-project.plist"
+check "config was written" [ -f "$AFAR_CLI_HOME/services/my-project.conf" ]
+check "launchd plist is valid" plutil -lint "$AFAR_CLI_AGENTS_DIR/$AFAR_CLI_LABEL_PREFIX.my-project.plist"
 check "agent is loaded in launchd" loaded my-project
 wait_for 10 "claude is running" state_is my-project running
 PID1=$(child my-project)
 check "claude runs in the service folder, in same-dir mode" grep -q "^$PID1 start mode=serve args=--spawn same-dir cwd=$P1\$" "$FAKE/events"
-check "add saves same-dir as the spawn mode" grep -qx 'RCD_SPAWN=same-dir' "$AFAR_RCD_HOME/services/my-project.conf"
+check "add saves same-dir as the spawn mode" grep -qx 'RCD_SPAWN=same-dir' "$AFAR_CLI_HOME/services/my-project.conf"
 check "status --json shows the spawn mode" [ "$(jsonq 'j.services[0].spawn' my-project)" = same-dir ]
 wait_for 5 "caffeinate keeps the Mac awake while claude runs" caffeinated i "$PID1"
 check "status lists the service as running" sh -c "'$TOOL' status | grep -q '^my-project  *running  *$PID1'"
@@ -182,11 +182,11 @@ check "status NAME shows the environment link" sh -c "'$TOOL' status my-project 
 check "status FOLDER resolves the service" sh -c "'$TOOL' status '$P1' | grep -q running"
 check "logs shows claude's output" sh -c "'$TOOL' logs my-project | grep -q '\[claude\] Take this session with you'"
 sleep 3
-check "the log does not grow while claude redraws" [ "$(grep -c 'Capacity:' "$AFAR_RCD_LOG_DIR/my-project.log")" -eq 1 ]
-check "the log has no escape codes" [ "$(tr -cd '\033' <"$AFAR_RCD_LOG_DIR/my-project.log" | wc -c | tr -d ' ')" -eq 0 ]
-check "session links keep their target" grep -q "fake-session <https://claude.ai/code/session_fake$PID1?from=cli>" "$AFAR_RCD_LOG_DIR/my-project.log"
+check "the log does not grow while claude redraws" [ "$(grep -c 'Capacity:' "$AFAR_CLI_LOG_DIR/my-project.log")" -eq 1 ]
+check "the log has no escape codes" [ "$(tr -cd '\033' <"$AFAR_CLI_LOG_DIR/my-project.log" | wc -c | tr -d ' ')" -eq 0 ]
+check "session links keep their target" grep -q "fake-session <https://claude.ai/code/session_fake$PID1?from=cli>" "$AFAR_CLI_LOG_DIR/my-project.log"
 printf '1/32\n' >"$FAKE/capacity"
-wait_for 5 "changes in the status block are logged" grep -q 'Capacity: 1/32' "$AFAR_RCD_LOG_DIR/my-project.log"
+wait_for 5 "changes in the status block are logged" grep -q 'Capacity: 1/32' "$AFAR_CLI_LOG_DIR/my-project.log"
 wait_for 5 "status counts connected sessions" sh -c "'$TOOL' status my-project | grep -q 'sessions: *1 connected'"
 check "status shows the connection state" sh -c "'$TOOL' status my-project | grep -q 'connection: *Connected'"
 check "the status table has a sessions column" sh -c "'$TOOL' status | grep -q '^my-project  *running  *[0-9]*  *[0-9a-z]*  *1  '"
@@ -210,13 +210,13 @@ check "status --json shows it stopped, without a pid" [ "$(jsonq 'j.services[0].
 check "no claude left running" no_fakes
 check "caffeinate stopped too" sh -c "! pgrep -f 'caffeinate -i -w $PID2'"
 check "status shows stopped" sh -c "'$TOOL' status | grep -q '^my-project  *stopped'"
-check "the log has no job-control noise" sh -c "! grep -Eq '^\[[0-9]+\]' '$AFAR_RCD_LOG_DIR/my-project.log'"
-check "agent is disabled so it stays stopped after a restart" sh -c "launchctl print-disabled '$(domain)' | grep -Eq '\"$AFAR_RCD_LABEL_PREFIX.my-project\" => (disabled|true)'"
+check "the log has no job-control noise" sh -c "! grep -Eq '^\[[0-9]+\]' '$AFAR_CLI_LOG_DIR/my-project.log'"
+check "agent is disabled so it stays stopped after a restart" sh -c "launchctl print-disabled '$(domain)' | grep -Eq '\"$AFAR_CLI_LABEL_PREFIX.my-project\" => (disabled|true)'"
 
 section "start"
 rcd start my-project </dev/null >/dev/null
 wait_for 10 "claude is running again" running_new my-project "$PID2"
-check "agent is enabled again" sh -c "! launchctl print-disabled '$(domain)' | grep -Eq '\"$AFAR_RCD_LABEL_PREFIX.my-project\" => (disabled|true)'"
+check "agent is enabled again" sh -c "! launchctl print-disabled '$(domain)' | grep -Eq '\"$AFAR_CLI_LABEL_PREFIX.my-project\" => (disabled|true)'"
 PID3=$(child my-project)
 
 section "restart"
@@ -233,10 +233,10 @@ wait_for 10 "claude is running with a session" running_new my-project "$PID4"
 PID4=$(child my-project)
 check "it is valid JSON with a schema version" [ "$(jsonq 'j.schema')" = 1 ]
 check "it reports state, pid and folder" [ "$(jsonq 'j.services[0].state + " " + j.services[0].pid + " " + j.services[0].folder')" = "running $PID4 $P1" ]
-check "it reports the log file" [ "$(jsonq 'j.services[0].log')" = "$AFAR_RCD_LOG_DIR/my-project.log" ]
+check "it reports the log file" [ "$(jsonq 'j.services[0].log')" = "$AFAR_CLI_LOG_DIR/my-project.log" ]
 check "it reports the connection and environment link" [ "$(jsonq 'j.services[0].connection + " " + j.services[0].url')" = "Connected https://claude.ai/code?environment=env_fake$PID4" ]
 wait_for 5 "it lists the sessions with their status" first_session_busy
-check "session entries link to the session" sh -c "[ \"\$(AFAR_RCD_LIB=1 /bin/bash -c '. \"$TOOL\"; session_list json $PID4')\" != '[]' ]"
+check "session entries link to the session" sh -c "[ \"\$(AFAR_CLI_LIB=1 /bin/bash -c '. \"$TOOL\"; session_list json $PID4')\" != '[]' ]"
 check "sessions have the title the Claude app shows" [ "$(jsonq 'j.services[0].sessions[0].title + " " + j.services[0].sessions[0].name' my-project)" = "Fix the login bug fake-session" ]
 check "status NAME lists the sessions by title" sh -c "'$TOOL' status my-project | grep -q -- '- Fix the login bug (busy) https://claude.ai/code/session_fakekid'"
 mkdir -p "$T/nopgrep"
@@ -251,7 +251,7 @@ mode consent
 rcd restart my-project </dev/null >/dev/null 2>&1
 wait_for 10 "state is needs-setup" state_is my-project needs-setup
 wait_for 5 "a notification asks to run setup" grep -q "one-time confirmation" "$NOTES"
-check "status explains how to fix it" sh -c "'$TOOL' status my-project | grep -q 'afar-rcd setup my-project'"
+check "status explains how to fix it" sh -c "'$TOOL' status my-project | grep -q 'afar-cli setup my-project'"
 check "it does not restart in a tight loop" [ "$(grep -c 'start mode=consent' "$FAKE/events")" -le 2 ]
 mode serve
 wait_for 15 "it recovers on its own once enabled" running_new my-project "$PID4"
@@ -320,7 +320,7 @@ rcd restart my-project </dev/null >/dev/null 2>&1
 wait_for 10 "state is restarting" state_is my-project restarting
 wait_for 15 "it keeps retrying" more_starts $((N + 2))
 wait_for 20 "a notification says it keeps stopping" grep -q "keeps stopping" "$NOTES"
-check "the log records the exit status" grep -q 'exited with status 3' "$AFAR_RCD_LOG_DIR/my-project.log"
+check "the log records the exit status" grep -q 'exited with status 3' "$AFAR_CLI_LOG_DIR/my-project.log"
 mode serve
 wait_for 15 "it recovers when claude works again" running_new my-project "$PID7"
 PID8=$(child my-project)
@@ -341,7 +341,7 @@ wait_for 10 "claude is running again" running_new my-project "$PID9"
 PID10=$(child my-project)
 
 section "supervisor killed outright"
-SUP=$(launchctl print "$(domain)/$AFAR_RCD_LABEL_PREFIX.my-project" | awk '$1 == "pid" { print $3; exit }')
+SUP=$(launchctl print "$(domain)/$AFAR_CLI_LABEL_PREFIX.my-project" | awk '$1 == "pid" { print $3; exit }')
 check "launchd knows the supervisor pid" [ -n "$SUP" ]
 HELPERS=$(pgrep -P "$SUP" -f "_run my-project" | tr '\n' ' ')
 check "the supervisor runs its helpers" [ -n "$HELPERS" ]
@@ -360,7 +360,7 @@ check "add refuses worktree outside git" sh -c "! '$TOOL' add '$T/plain' --spawn
 mkdir -p "$P1/.git"
 PIDS=$(child my-project)
 if rcd spawn my-project worktree </dev/null >"$T/spawn.out" 2>&1; then pass "spawn switches to worktree"; else fail "spawn switches to worktree"; cat "$T/spawn.out"; fi
-check "spawn saves the mode" grep -qx 'RCD_SPAWN=worktree' "$AFAR_RCD_HOME/services/my-project.conf"
+check "spawn saves the mode" grep -qx 'RCD_SPAWN=worktree' "$AFAR_CLI_HOME/services/my-project.conf"
 wait_for 15 "spawn restarts a running service" running_new my-project "$PIDS"
 PIDS=$(child my-project)
 check "claude restarts in worktree mode" grep -q "^$PIDS start mode=serve args=--spawn worktree cwd=$P1\$" "$FAKE/events"
@@ -389,7 +389,7 @@ rcd stop two </dev/null >/dev/null 2>&1
 check "spawn on a stopped service succeeds" sh -c "'$TOOL' spawn two same-dir </dev/null >/dev/null"
 check "spawn leaves a stopped service stopped" not_loaded two
 check "spawn moves the mode out of the arguments" \
-  sh -c "grep -qx 'RCD_SPAWN=same-dir' '$AFAR_RCD_HOME/services/two.conf' && grep -qx 'RCD_ARGS=( --capacity 4 )' '$AFAR_RCD_HOME/services/two.conf'"
+  sh -c "grep -qx 'RCD_SPAWN=same-dir' '$AFAR_CLI_HOME/services/two.conf' && grep -qx 'RCD_ARGS=( --capacity 4 )' '$AFAR_CLI_HOME/services/two.conf'"
 rcd start two </dev/null >/dev/null 2>&1
 wait_for 10 "second service runs again" state_is two running
 check "it starts with the new spawn mode" grep -q "^$(child two) start mode=serve args=--spawn same-dir --capacity 4 cwd=$P2\$" "$FAKE/events"
@@ -399,11 +399,11 @@ check "doctor passes" sh -c "'$TOOL' doctor </dev/null"
 check "doctor explains what happens after a restart" sh -c "'$TOOL' doctor </dev/null | grep -q 'After a restart'"
 
 section "remove"
-cp -R "$AFAR_RCD_LOG_DIR" "$T/saved-logs" 2>/dev/null
+cp -R "$AFAR_CLI_LOG_DIR" "$T/saved-logs" 2>/dev/null
 rcd remove --all >/dev/null
-check "agents are unloaded" sh -c "! launchctl print '$(domain)/$AFAR_RCD_LABEL_PREFIX.my-project' && ! launchctl print '$(domain)/$AFAR_RCD_LABEL_PREFIX.two'"
-check "plists are gone" [ -z "$(ls "$AFAR_RCD_AGENTS_DIR")" ]
-check "configs are gone" [ -z "$(ls "$AFAR_RCD_HOME/services")" ]
+check "agents are unloaded" sh -c "! launchctl print '$(domain)/$AFAR_CLI_LABEL_PREFIX.my-project' && ! launchctl print '$(domain)/$AFAR_CLI_LABEL_PREFIX.two'"
+check "plists are gone" [ -z "$(ls "$AFAR_CLI_AGENTS_DIR")" ]
+check "configs are gone" [ -z "$(ls "$AFAR_CLI_HOME/services")" ]
 check "no claude left running" no_fakes
 
 # ------------------------------------------------------------------------------

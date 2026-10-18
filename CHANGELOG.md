@@ -1,7 +1,8 @@
 # Changelog
 
-## Unreleased
+## 0.4.0 - 2026-10-18
 
+- Renamed from afar-rcd to afar-cli: the command, its settings variables (AFAR_CLI_*), config and log folders (`~/.config/afar-cli`, `~/Library/Logs/afar-cli`), launchd labels (com.github.johannesreich1.afar-cli.*), the repository and the Homebrew formula. Services added with afar-rcd keep running under its labels; see "Coming from afar-rcd" in the README to move them over.
 - The connection state no longer stays at `Reconnecting` after claude reconnects: "Reconnected after …" and "Ready" now count as `Connected`.
 - `status --json` gives each session a `title`, the one the Claude app shows (schema 1). `status NAME` lists sessions by title.
 
