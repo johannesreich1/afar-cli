@@ -6,7 +6,7 @@ class AfarCli < Formula
   desc "Keep Claude Code Remote Control running in the background"
   homepage "https://github.com/johannesreich1/afar-cli"
   url "https://github.com/johannesreich1/afar-cli/archive/refs/tags/v0.4.0.tar.gz"
-  sha256 "0000000000000000000000000000000000000000000000000000000000000000"
+  sha256 "14d68869f621e93f60f48da124ec0e18e5576d25b11beec25392f03bccbab650"
   license "MIT"
   head "https://github.com/johannesreich1/afar-cli.git", branch: "main"
 
