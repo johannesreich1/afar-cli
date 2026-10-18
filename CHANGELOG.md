@@ -1,5 +1,10 @@
 # Changelog
 
+## Unreleased
+
+- The connection state no longer stays at `Reconnecting` after claude reconnects: "Reconnected after …" and "Ready" now count as `Connected`.
+- `status --json` gives each session a `title`, the one the Claude app shows (schema 1). `status NAME` lists sessions by title.
+
 ## 0.3.0 - 2026-10-17
 
 - Each service has a spawn mode: `same-dir` (the default for new services) or `worktree`. afar-rcd always passes it to `claude remote-control`, so Claude Code no longer asks "Choose [1/2]" during setup.

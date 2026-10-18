@@ -188,15 +188,16 @@ afar-rcd doctor
   "url": "https://claude.ai/code?environment=env_...", "message": null,
   "keep_awake": "always", "spawn": "same-dir", "log": "/Users/me/Library/Logs/afar-rcd/my-app.log",
   "session_count": 1,
-  "sessions": [{"id": "session_...", "name": "...", "url": "https://claude.ai/code/session_...",
-                "status": "busy", "since": 1792161505, "pid": 54971}]
+  "sessions": [{"id": "session_...", "name": "my-app-f9", "title": "Fix the login bug",
+                "url": "https://claude.ai/code/session_...", "status": "busy", "since": 1792161505, "pid": 54971}]
 }]}
 ```
 
 - `state` is one of `running`, `starting`, `restarting`, `needs-setup`, `needs-login`, `error` or `stopped`. `needs-login` can appear while claude still runs (see [When something needs you](#when-something-needs-you)).
 - `connection` is `Connected`, `Connecting`, `Reconnecting` or `Disconnected` as claude reports it, or `null`.
 - `spawn` is the [spawn mode](#spawn-mode) the service runs with: `same-dir`, `worktree`, or `session` when it serves one session only. Added in 0.3.0.
-- `session_count` comes from claude's own status line. `sessions` is best effort: it reads Claude Code's per-session state files, which are internal to Claude Code and may change, so `status` values are passed through as-is (for example `busy` or `waiting`).
+- `session_count` comes from claude's own status line. `sessions` is best effort: it reads Claude Code's per-session state files, which are internal to Claude Code and may change, so `status` values are passed through as-is (for example `busy` or `waiting`). A session's `since` is when its status last changed.
+- A session's `title` is the one the Claude app shows, as claude lists it in its output (it shortens long ones with `…`), or `null` before the session has one. `name` is a short name Claude Code derives from the folder. `id` is `null` when Claude Code has not recorded the session's claude.ai id.
 - Times are Unix seconds, and unknown values are `null`. Within schema 1, fields are only ever added, never changed or removed. With no services, `services` is an empty list.
 
 ## Security

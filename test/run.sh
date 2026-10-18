@@ -108,6 +108,13 @@ lib() { AFAR_RCD_LIB=1 /bin/bash -c ". '$TOOL'; $1"; }
 check "default_name cleans up folder names" [ "$(lib 'default_name "/x/My Cool_Project!!"')" = "my-cool_project" ]
 check "default_name falls back for odd names" [ "$(lib 'default_name "/x/!!!"')" = "project" ]
 check "backoff doubles from the minimum" [ "$(lib 'AFAR_RCD_BACKOFF_MIN=5 AFAR_RCD_BACKOFF_MAX=300; RCD_BACKOFF_MIN=5 RCD_BACKOFF_MAX=300; backoff 3')" = 20 ]
+conn() { printf '%s\n' "$@" | lib connection_of; }
+check "a reconnect is not connected yet" [ "$(conn '2026-10-17 11:39:42 [claude] ·✔︎· Connected · afar · main' \
+  '2026-10-17 11:58:28 [claude] ·|· Reconnecting · retrying in 2.4s · disconnected 0s')" = Reconnecting ]
+check "connected again after \"Reconnected after\"" [ "$(conn '2026-10-17 11:58:28 [claude] ·|· Reconnecting · retrying in 2.4s · disconnected 0s' \
+  '2026-10-17 11:59:00 [claude] [11:59:00] Reconnected after 31s')" = Connected ]
+check "\"Ready\" is connected" [ "$(conn '2026-10-17 11:39:42 [claude] ·|· Connecting · afar · main' \
+  '2026-10-17 11:39:45 [claude] ·✔︎· Ready · afar · main')" = Connected ]
 check "backoff stops at the maximum" [ "$(lib 'RCD_BACKOFF_MIN=5 RCD_BACKOFF_MAX=300; backoff 30')" = 300 ]
 check "fmt_dur formats durations" [ "$(lib 'fmt_dur 45; fmt_dur 3700; fmt_dur 90000')" = "45s1h1m1d1h" ]
 check "xml_escape escapes markup" [ "$(lib 'xml_escape "a&b<c>"')" = "a&amp;b&lt;c&gt;" ]
@@ -230,7 +237,8 @@ check "it reports the log file" [ "$(jsonq 'j.services[0].log')" = "$AFAR_RCD_LO
 check "it reports the connection and environment link" [ "$(jsonq 'j.services[0].connection + " " + j.services[0].url')" = "Connected https://claude.ai/code?environment=env_fake$PID4" ]
 wait_for 5 "it lists the sessions with their status" first_session_busy
 check "session entries link to the session" sh -c "[ \"\$(AFAR_RCD_LIB=1 /bin/bash -c '. \"$TOOL\"; session_list json $PID4')\" != '[]' ]"
-check "status NAME lists the sessions too" sh -c "'$TOOL' status my-project | grep -q -- '- fake-session (busy) https://claude.ai/code/session_fakekid'"
+check "sessions have the title the Claude app shows" [ "$(jsonq 'j.services[0].sessions[0].title + " " + j.services[0].sessions[0].name' my-project)" = "Fix the login bug fake-session" ]
+check "status NAME lists the sessions by title" sh -c "'$TOOL' status my-project | grep -q -- '- Fix the login bug (busy) https://claude.ai/code/session_fakekid'"
 mkdir -p "$T/nopgrep"
 printf '#!/bin/sh\nexit 1\n' >"$T/nopgrep/pgrep"
 chmod +x "$T/nopgrep/pgrep"

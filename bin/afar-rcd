@@ -259,12 +259,14 @@ session_count() {
 }
 
 # Lists the sessions claude (PID) is serving, as JSON or as tab-separated
-# "name status url" lines. claude remote-control runs one child process per
+# "title status url" lines. claude remote-control runs one child process per
 # session, and each records its state in ~/.claude/sessions/<pid>.json. Those
 # files are internal to Claude Code, so this is best effort: no files, no
 # sessions listed (the session count still comes from claude's own output).
+# TITLES is session_titles' output: a session's title is the one shown in the
+# Claude app, its name a short one Claude Code derives from the folder.
 session_list() {
-  local format=$1 pid=$2 kids
+  local format=$1 pid=$2 titles=${3-} kids
   # ps rather than pgrep: in some sandboxes (such as a Claude Code session's
   # own commands) `pgrep -P` finds nothing while ps still lists processes.
   kids=$(ps -ax -o pid=,ppid= 2>/dev/null | awk -v p="$pid" '$2 == p { printf "%s ", $1 }')
@@ -273,21 +275,27 @@ session_list() {
     return 0
   fi
   # shellcheck disable=SC2086 # one pid per word
-  /usr/bin/osascript -l JavaScript - "$format" "${CLAUDE_CONFIG_DIR:-$HOME/.claude}/sessions" $kids 2>/dev/null <<'JXA' ||
+  /usr/bin/osascript -l JavaScript - "$format" "${CLAUDE_CONFIG_DIR:-$HOME/.claude}/sessions" "$titles" $kids 2>/dev/null <<'JXA' ||
 ObjC.import('Foundation');
 function run(argv) {
-  var format = argv[0], dir = argv[1], list = [];
-  for (var i = 2; i < argv.length; i++) {
+  var format = argv[0], dir = argv[1], titles = {}, list = [];
+  // The latest title of each session wins. "Attached" is shown before a session has one.
+  argv[2].split('\n').forEach(function (line) {
+    var m = /\[claude\] {5}(.*\S) <https:\/\/claude\.ai\/code\/(session_[A-Za-z0-9]+)\?[^>]*>$/.exec(line);
+    if (m && m[1] !== 'Attached') titles[m[2]] = m[1];
+  });
+  for (var i = 3; i < argv.length; i++) {
     var s = $.NSString.stringWithContentsOfFileEncodingError(dir + '/' + argv[i] + '.json', $.NSUTF8StringEncoding, null);
     if (!s || s.isNil()) continue;
     var j;
     try { j = JSON.parse(s.js); } catch (e) { continue; }
     var id = j.bridgeSessionId || null;
-    list.push({ id: id, name: j.name || null, url: id ? 'https://claude.ai/code/' + id : null, status: j.status || null,
+    list.push({ id: id, name: j.name || null, title: (id && titles[id]) || null,
+      url: id ? 'https://claude.ai/code/' + id : null, status: j.status || null,
       since: j.statusUpdatedAt ? Math.floor(j.statusUpdatedAt / 1000) : null, pid: Number(argv[i]) });
   }
   if (format === 'json') return JSON.stringify(list);
-  return list.map(function (x) { return [x.name || '?', x.status || '?', x.url || ''].join('\t'); }).join('\n');
+  return list.map(function (x) { return [x.title || x.name || '?', x.status || '?', x.url || ''].join('\t'); }).join('\n');
 }
 JXA
     if [ "$format" = json ]; then printf '[]\n'; fi
@@ -306,8 +314,22 @@ json_str() {
 json_num() { case "$1" in '' | *[!0-9]*) printf 'null' ;; *) printf '%s' "$1" ;; esac; }
 
 # Connected, Connecting, Reconnecting or Disconnected, from claude's status line.
-connection_state() {
-  run_output "$1" | sed -E -n 's/.*\[claude\] [^A-Za-z]*(Connected|Connecting|Reconnecting|Disconnected) .*/\1/p' | tail -n 1
+connection_state() { run_output "$1" | connection_of; }
+
+# The latest connection state in claude's output on stdin. After a reconnect
+# claude logs "Reconnected after 31s" and then "Ready", not "Connected".
+connection_of() {
+  sed -E -n \
+    -e 's/.*\[claude\] [^A-Za-z]*(Connected|Connecting|Reconnecting|Disconnected) .*/\1/p' \
+    -e 's/.*\[claude\] [^A-Za-z]*(Ready|Reconnected after) .*/Connected/p' |
+    tail -n 1
+}
+
+# The lines in claude's output that name a session. claude lists each one as
+# "    TITLE <https://claude.ai/code/session_ID?from=cli>" (session_list picks
+# the title of each session from them).
+session_titles() {
+  run_output "$1" | grep -E '\[claude\]     .* <https://claude\.ai/code/session_[A-Za-z0-9]+[?][^>]*>$'
 }
 
 # ------------------------------------------------------------------ claude ---
@@ -1382,7 +1404,7 @@ service_json() {
   svc_status "$n"
   msg=$S_ALERT
   if [ -z "$msg" ] && [ "$S_STATE" != running ] && [ "$S_STATE" != stopped ]; then msg=$ST_MESSAGE; fi
-  if [ "$S_PID" != - ]; then sessions=$(session_list json "$S_PID"); fi
+  if [ "$S_PID" != - ]; then sessions=$(session_list json "$S_PID" "$(session_titles "$n")"); fi
   printf '{"name":%s,"folder":%s,"state":%s,"connection":%s,"pid":%s,"since":%s,"url":%s,"message":%s,' \
     "$(json_str "$n")" "$(json_str "$RCD_DIR")" "$(json_str "$S_STATE")" "$(json_str "$S_CONN")" \
     "$(json_num "$S_PID")" "$(json_num "$ST_SINCE")" "$(json_str "$S_URL")" "$(json_str "$msg")"
@@ -1426,7 +1448,7 @@ cmd_status() {
     if [ -n "$S_CONN" ]; then say "  connection:  $S_CONN"; fi
     if [ "$S_SESSIONS" != - ]; then say "  sessions:    $S_SESSIONS connected"; fi
     if [ "$S_PID" != - ]; then
-      session_list text "$S_PID" | while IFS=$(printf '\t') read -r sname sstatus surl; do
+      session_list text "$S_PID" "$(session_titles "$n")" | while IFS=$(printf '\t') read -r sname sstatus surl; do
         [ -n "$sname" ] || continue
         printf '               - %s (%s)%s\n' "$sname" "$sstatus" "${surl:+ $surl}"
       done
